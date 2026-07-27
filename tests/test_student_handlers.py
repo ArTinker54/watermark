@@ -9,7 +9,8 @@ from aiogram import Router
 from aiogram.types import Chat
 
 from app.bots.student.handlers import common, registration
-from app.bots.student.handlers.chats import on_membership_change
+from app.bots.student.handlers.chats import handle_group_id, on_membership_change
+from app.config import Settings
 
 
 class _FakeMember:
@@ -62,6 +63,46 @@ async def test_warns_when_bot_is_not_admin(caplog: pytest.LogCaptureFixture) -> 
         await on_membership_change(_FakeEvent(chat, "member"))
 
     assert "не администратор" in caplog.text
+
+
+class _FakeGroupMessage:
+    def __init__(self, chat: Chat, user_id: int) -> None:
+        self.chat = chat
+        self.from_user = _FakeUser(user_id)
+        self.replies: list[str] = []
+
+    async def reply(self, text: str) -> None:
+        self.replies.append(text)
+
+
+class _FakeUser:
+    def __init__(self, user_id: int) -> None:
+        self.id = user_id
+
+
+def _settings(admin_ids: str) -> Settings:
+    return Settings(
+        admin_bot_token="a:1",
+        student_bot_token="b:2",
+        admin_ids=admin_ids,
+        wm_pw_img=1,
+        wm_pw_wm=2,
+    )
+
+
+async def test_groupid_answers_the_author() -> None:
+    chat = Chat(id=-1001234567890, type="supergroup", title="VSA PRO")
+    message = _FakeGroupMessage(chat, user_id=987)
+    await handle_group_id(message, _settings("987"))
+    assert "VSA_GROUP_ID=-1001234567890" in message.replies[0]
+
+
+async def test_groupid_ignores_everyone_else() -> None:
+    """Посторонний в группе не должен даже узнать, что бот отвечает на команды."""
+    chat = Chat(id=-100999, type="supergroup", title="VSA PRO")
+    message = _FakeGroupMessage(chat, user_id=555)
+    await handle_group_id(message, _settings("987"))
+    assert message.replies == []
 
 
 async def test_private_chat_is_ignored(caplog: pytest.LogCaptureFixture) -> None:

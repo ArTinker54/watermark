@@ -9,15 +9,38 @@ from __future__ import annotations
 
 import logging
 
-from aiogram import Router
-from aiogram.types import ChatMemberUpdated
+from aiogram import F, Router
+from aiogram.filters import Command
+from aiogram.types import ChatMemberUpdated, Message
+
+from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="chats")
 
+_GROUP_TYPES = frozenset({"group", "supergroup"})
+
 #: Статусы, при которых getChatMember стабильно отвечает по чужим участникам.
 _CAN_CHECK_MEMBERS = frozenset({"administrator", "creator"})
+
+
+@router.message(Command("groupid"), F.chat.type.in_(_GROUP_TYPES))
+async def handle_group_id(message: Message, settings: Settings) -> None:
+    """Показать id чата. Только автору курса — остальным бот в группе молчит.
+
+    Событие о добавлении в группу приходит один раз и только если бот уже
+    работал в этот момент; команда же доступна всегда.
+    """
+    user = message.from_user
+    if user is None or user.id not in settings.admin_id_set:
+        return
+
+    await message.reply(
+        f"<code>VSA_GROUP_ID={message.chat.id}</code>\n\n"
+        "Это можно удалить — значение уже записано в журнал бота."
+    )
+    logger.info("запрошен id чата «%s»: VSA_GROUP_ID=%s", message.chat.title, message.chat.id)
 
 
 @router.my_chat_member()
