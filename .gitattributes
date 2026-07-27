@@ -1,0 +1,7 @@
+# Образ собирается под Linux — держим LF в репозитории независимо от того,
+# на какой ОС правят файлы.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.sqlite3 binary

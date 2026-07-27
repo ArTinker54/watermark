@@ -1,0 +1,51 @@
+"""Общий модуль водяного знака: формат метки + движок embed/extract/locate."""
+
+from __future__ import annotations
+
+from app.watermark.engine import (
+    CoarseMatch,
+    EmbedResult,
+    LocateMatch,
+    WatermarkEngine,
+    WatermarkError,
+    embed_async,
+    extract_async,
+    image_size,
+    load_bgr,
+    locate,
+    locate_async,
+    locate_coarse,
+    locate_coarse_async,
+    save_bgr,
+)
+from app.watermark.payload import (
+    MAX_LESSON_ID,
+    MAX_UID,
+    PAYLOAD_VERSION,
+    WM_BIT_LENGTH,
+    Payload,
+    bit_length,
+)
+
+__all__ = [
+    "MAX_LESSON_ID",
+    "MAX_UID",
+    "PAYLOAD_VERSION",
+    "WM_BIT_LENGTH",
+    "CoarseMatch",
+    "EmbedResult",
+    "LocateMatch",
+    "Payload",
+    "WatermarkEngine",
+    "WatermarkError",
+    "bit_length",
+    "embed_async",
+    "extract_async",
+    "image_size",
+    "load_bgr",
+    "locate",
+    "locate_async",
+    "locate_coarse",
+    "locate_coarse_async",
+    "save_bgr",
+]

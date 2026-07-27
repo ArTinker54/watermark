@@ -1,0 +1,21 @@
+# Основные зависимости.
+#
+# ВАЖНО: blind-watermark вынесен в requirements-wm.txt и ставится с --no-deps.
+# Он объявляет зависимость на opencv-python (сборку с GUI), а нам нужен
+# opencv-python-headless. Обе сборки кладут пакет cv2 в одно и то же место,
+# поэтому держать их вместе нельзя — выигрывает установленная последней.
+#
+#   pip install -r requirements.txt
+#   pip install --no-deps -r requirements-wm.txt
+
+aiogram==3.30.0
+SQLAlchemy==2.0.51
+aiosqlite==0.22.1
+pydantic-settings==2.14.2
+
+# Зависимости движка метки (перечислены явно, см. выше).
+# numpy зафиксирован на 2.2.x: под Python 3.11 колёс новее не собирают.
+opencv-python-headless==5.0.0.93
+numpy==2.2.6
+PyWavelets==1.8.0
+Pillow==12.2.0

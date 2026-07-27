@@ -1,0 +1,35 @@
+# Два процесса из одного образа: общий том с базой и картинками.
+#
+#   docker compose up -d --build
+#   docker compose logs -f admin-bot
+
+x-bot: &bot
+  build: .
+  env_file: .env
+  environment:
+    DB_PATH: /data/db.sqlite3
+    STORAGE_PATH: /data/storage
+  volumes:
+    - bot-data:/data
+    # Текст оферты правится на лету, без пересборки образа.
+    - ./app/texts/offer.txt:/app/app/texts/offer.txt:ro
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  student-bot:
+    <<: *bot
+    container_name: vsa-student-bot
+    command: python -m app.bots.student
+
+  admin-bot:
+    <<: *bot
+    container_name: vsa-admin-bot
+    command: python -m app.bots.admin
+    # Не зависимость по данным, а порядок запуска: admin-бот раздаёт уроки
+    # токеном student-бота, и в логах приятнее видеть его поднявшимся первым.
+    depends_on:
+      - student-bot
+
+volumes:
+  bot-data:

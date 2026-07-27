@@ -1,0 +1,33 @@
+[project]
+name = "vsa-watermark-bots"
+version = "0.1.0"
+description = "Персональная раздача уроков через Telegram с невидимой меткой участника"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["app", "tests"]
+ignore_missing_imports = true
+warn_return_any = false
+
+# В тестах фикстуры pytest не типизированы, и требовать аннотации на каждую
+# из них — шум ради шума. Тела при этом проверяются как обычно.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
