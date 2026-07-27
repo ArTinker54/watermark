@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+from app.watermark.engine import EMBED_VERSION
+
 
 @dataclass(frozen=True, slots=True)
 class Storage:
@@ -72,9 +74,15 @@ class Storage:
         return self.lesson_dir(lesson_id) / f"orig_{position}.png"
 
     def marked(self, lesson_id: int, uid: int, position: int) -> Path:
+        """Путь персональной копии.
+
+        В имени есть версия процедуры встраивания: готовые копии на диске
+        переиспользуются, и без версии повторная рассылка после исправления
+        движка молча отдала бы старые, нечитаемые файлы.
+        """
         directory = self.marked_root / str(lesson_id)
         directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{uid:04d}_{position}.png"
+        return directory / f"{uid:04d}_{position}_v{EMBED_VERSION}.png"
 
     # --- Трассировка ---
 

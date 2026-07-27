@@ -138,7 +138,13 @@ class TraceService:
         scanned = await asyncio.gather(*(scan(lesson, image) for lesson, image in pairs))
         found = [item for item in scanned if item is not None]
         found.sort(key=lambda item: item.coarse.confidence, reverse=True)
-        return [item for item in found if item.coarse.confidence >= self._min_confidence]
+
+        above = [item for item in found if item.coarse.confidence >= self._min_confidence]
+        # Лучшего кандидата пробуем даже при слабом совпадении: на почти
+        # однотонной картинке корреляция низкая сама по себе, а метка при этом
+        # может читаться. Ложное опознание тут не грозит — результат всё равно
+        # проходит сверку lesson_id и наличия ученика.
+        return above or found[:1]
 
     async def _try_candidate(self, suspect: BgrImage, candidate: _Candidate) -> TraceHit | None:
         original = Path(candidate.image.path)

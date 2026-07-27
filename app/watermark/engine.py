@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
@@ -38,6 +39,32 @@ BgrImage = NDArray[np.uint8]
 def _u8(array: NDArray[Any]) -> NDArray[np.uint8]:
     """Стабы cv2 обещают размытый dtype, хотя на входе и выходе uint8."""
     return cast("NDArray[np.uint8]", array)
+
+
+#: Версия процедуры встраивания. Меняется, когда меченые копии, сделанные
+#: старым кодом, перестают быть эквивалентны новым, — тогда закэшированные
+#: на диске копии надо перегенерировать, а не переиспользовать.
+EMBED_VERSION: Final[int] = 2
+
+#: Потолок яркости, к которому приводится картинка ПЕРЕД встраиванием.
+#:
+#: На скриншоте светлого торгового терминала до 98% пикселей — чистый белый
+#: (255). blind-watermark кодирует бит, СДВИГАЯ ВВЕРХ старшее сингулярное
+#: число блока, и в сплошном белом сдвигать некуда: модуляция получается
+#: вырожденной, JPEG возвращает блок к ровному тону, и метка гибнет при любом
+#: сжатии — хотя из PNG ещё читается. Потолок возвращает ей запас.
+#:
+#: Только сверху: у нижней границы места хватает, тёмные картинки проходят
+#: всю цепочку атак и без подготовки (см. тесты на тёмный график).
+#:
+#: Операция самонастраивающаяся: картинку без насыщенных пикселей она вообще
+#: не трогает. Для белого фона это сдвиг на 4/255 = 1.6%, глазом не различимый.
+EMBED_CEILING: Final[int] = 251
+
+
+def add_headroom(image: BgrImage) -> BgrImage:
+    """Оставить метке запас под верхней границей. См. ``EMBED_CEILING``."""
+    return _u8(np.minimum(image, EMBED_CEILING))
 
 # --- Параметры поиска графика на скриншоте -------------------------------------
 # Масштаб задаётся целым процентом, а ширина шаблона считается как
@@ -156,8 +183,13 @@ class WatermarkEngine:
         )
 
     def embed(self, src: Path, dst: Path, payload: Payload) -> EmbedResult:
-        """Вшить метку в ``src`` и записать результат в ``dst`` (PNG, без потерь)."""
-        source = load_bgr(src)
+        """Вшить метку в ``src`` и записать результат в ``dst`` (PNG, без потерь).
+
+        Оригинал на диске остаётся нетронутым: запас по яркости получает только
+        выдаваемая копия. Для выравнивания при трассировке нужна геометрия
+        оригинала, а не его пиксели, поэтому пристинность не страдает.
+        """
+        source = add_headroom(load_bgr(src))
         height, width = source.shape[:2]
 
         bwm = self._new()
@@ -228,11 +260,34 @@ class WatermarkEngine:
 # --- Поиск графика на скриншоте ------------------------------------------------
 
 
-def _percent_widths(template_width: int, low_pct: int, high_pct: int, step_pct: int) -> list[int]:
-    """Ширины шаблона для масштабов ``low..high`` процентов — целочисленно."""
-    low = max(LOCATE_SCALE_MIN_PCT, low_pct)
-    high = min(LOCATE_SCALE_MAX_PCT, high_pct)
-    return sorted({template_width * pct // 100 for pct in range(low, high + 1, step_pct)})
+def coarse_percents() -> list[int]:
+    """Сетка масштабов грубого прохода. Строится ОТ 100% в обе стороны.
+
+    100% — самый частый случай: утёкшую картинку чаще всего просто пересылают
+    как есть. При этом промах даже на 2% по масштабу роняет корреляцию на
+    детализированном графике в разы (0.99 против 0.43), и урок не опознаётся.
+    Наивная сетка ``range(30, 201, 4)`` даёт 30, 34, ... 198 — ровно 100 в неё
+    и не попадает, поэтому отсчёт идёт от 100, а не от нижней границы.
+    """
+    step = LOCATE_COARSE_STEP_PCT
+    down = range(100, LOCATE_SCALE_MIN_PCT - 1, -step)
+    up = range(100, LOCATE_SCALE_MAX_PCT + 1, step)
+    return sorted({*down, *up})
+
+
+def _percent_widths(template_width: int, percents: Iterable[int]) -> list[int]:
+    """Ширины шаблона для заданных масштабов — целочисленно.
+
+    Именно целочисленно: ``int(W * 0.6)`` даёт 575 вместо 576, потому что 0.6
+    не представима в double, а промах в пиксель ломает извлечение метки.
+    """
+    return sorted(
+        {
+            template_width * pct // 100
+            for pct in percents
+            if LOCATE_SCALE_MIN_PCT <= pct <= LOCATE_SCALE_MAX_PCT
+        }
+    )
 
 
 def _match_best(
@@ -301,14 +356,7 @@ def locate_coarse(screenshot: Path | BgrImage, original: Path | BgrImage) -> Coa
         small_shot, small_tpl = shot_gray, tpl_gray
 
     coarse = _match_best(
-        small_shot,
-        small_tpl,
-        _percent_widths(
-            small_tpl.shape[1],
-            LOCATE_SCALE_MIN_PCT,
-            LOCATE_SCALE_MAX_PCT,
-            LOCATE_COARSE_STEP_PCT,
-        ),
+        small_shot, small_tpl, _percent_widths(small_tpl.shape[1], coarse_percents())
     )
     if coarse is None:
         return None
@@ -350,9 +398,10 @@ def locate(
         tpl_gray,
         _percent_widths(
             tpl_w,
-            coarse.percent - LOCATE_FINE_WINDOW_PCT,
-            coarse.percent + LOCATE_FINE_WINDOW_PCT,
-            1,
+            range(
+                coarse.percent - LOCATE_FINE_WINDOW_PCT,
+                coarse.percent + LOCATE_FINE_WINDOW_PCT + 1,
+            ),
         ),
     )
     if best is None:

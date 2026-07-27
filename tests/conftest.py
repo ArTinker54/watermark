@@ -68,6 +68,65 @@ def make_chart(width: int = 960, height: int = 600, seed: int = 7) -> Image.Imag
     return image
 
 
+def make_terminal_chart(
+    width: int = 1280, height: int = 828, seed: int = 3, *, dark: bool = False
+) -> Image.Image:
+    """Скриншот торгового терминала: тонкие свечи и МНОГО однотонного фона.
+
+    Принципиально отличается от :func:`make_chart`: здесь до 98% пикселей —
+    сплошная заливка у самой границы диапазона. Именно на такой картинке метка
+    гибнет при JPEG, если не оставить ей запаса по яркости, — а на плотном
+    графике проблема не проявляется вовсе.
+    """
+    rng = np.random.default_rng(seed)
+    # Тёмная тема берётся именно чёрной, а не «почти чёрной»: смысл фикстуры —
+    # прижать фон к самой границе диапазона, с обеих сторон по очереди.
+    background = (0, 0, 0) if dark else (255, 255, 255)
+    ink = (255, 255, 255) if dark else (40, 40, 40)
+    grid = (26, 26, 26) if dark else (242, 242, 242)
+
+    image = Image.new("RGB", (width, height), background)
+    draw = ImageDraw.Draw(image)
+
+    draw.line([(width - 90, 0), (width - 90, height)], fill=grid, width=1)
+    for i in range(1, 8):
+        gridline = height * i // 8
+        draw.line([(0, gridline), (width - 90, gridline)], fill=grid, width=1)
+    for fraction in (0.30, 0.46, 0.60):
+        level = round(height * fraction)
+        draw.line([(0, level), (width - 90, level)], fill=(60, 90, 200), width=1)
+
+    count = 120
+    price = np.cumsum(rng.normal(0, 1.0, count))
+    price = (price - price.min()) / max(float(np.ptp(price)), 1e-6)
+    base_y = height * 0.72
+    span = height * 0.34
+    step = (width - 130) / count
+
+    for i in range(count):
+        x = 30 + i * step
+        mid = base_y - price[i] * span
+        body = rng.uniform(2, 9)
+        draw.line([(x, mid - rng.uniform(3, 14)), (x, mid + rng.uniform(3, 14))], fill=ink, width=1)
+        draw.rectangle(
+            [x - 2, mid - body / 2, x + 2, mid + body / 2],
+            outline=ink,
+            fill=background if rng.random() > 0.5 else ink,
+        )
+        volume = rng.uniform(2, 26)
+        draw.rectangle([x - 2, height - 40 - volume, x + 2, height - 40], fill=(90, 160, 90))
+
+    draw.text((width - 84, 8), "H: 11.7180", fill=ink)
+    draw.text((30, height - 22), "27.07.2026  10:20", fill=ink)
+    return image
+
+
+def flat_share(image: Image.Image) -> float:
+    """Доля пикселей, вплотную прижатых к границе диапазона яркости."""
+    gray = np.asarray(image.convert("L"))
+    return float(((gray >= 250) | (gray <= 5)).mean())
+
+
 @pytest.fixture(scope="session")
 def chart_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("originals") / "lesson.png"

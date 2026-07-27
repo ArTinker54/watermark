@@ -9,13 +9,25 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from blind_watermark import WaterMark
 from PIL import Image
 
 from app.watermark import Payload, WatermarkEngine, locate
+from app.watermark.engine import add_headroom, coarse_percents
 from app.watermark.payload import WM_BIT_LENGTH
-from tests.conftest import PW_IMG, PW_WM, jpeg, psnr, rescale, screenshot, to_bgr
+from tests.conftest import (
+    PW_IMG,
+    PW_WM,
+    flat_share,
+    jpeg,
+    make_terminal_chart,
+    psnr,
+    rescale,
+    screenshot,
+    to_bgr,
+)
 
 PAYLOAD = Payload(uid=42, lesson_id=1)
 
@@ -118,3 +130,71 @@ def test_jpeg30_is_out_of_scope(engine: WatermarkEngine, marked) -> None:
     with Image.open(marked.path) as image:
         attacked = jpeg(image, 30)
     assert engine.extract(to_bgr(attacked), marked.size) != PAYLOAD
+
+
+# --- Однотонный фон: реальный материал клиента --------------------------------
+
+
+def test_terminal_chart_is_mostly_flat() -> None:
+    """Проверка предпосылки: скрин терминала почти целиком однотонный."""
+    assert flat_share(make_terminal_chart()) > 0.9
+    assert flat_share(make_terminal_chart(dark=True)) > 0.9
+
+
+def test_headroom_does_not_touch_unsaturated_images() -> None:
+    """На картинке без насыщенных пикселей подготовка — пустая операция."""
+    image = np.full((16, 16, 3), 128, dtype=np.uint8)
+    assert np.array_equal(add_headroom(image), image)
+
+
+@pytest.mark.parametrize("dark", [False, True])
+@pytest.mark.parametrize("quality", [95, 87, 80])
+def test_survives_jpeg_on_flat_chart(
+    engine: WatermarkEngine, tmp_path: Path, dark: bool, quality: int
+) -> None:
+    """Скрин терминала: без запаса по яркости метка гибнет уже на jpeg95.
+
+    Из PNG она при этом читается, поэтому проверять надо именно сжатие —
+    ровно так дефект и дожил до боевой рассылки.
+    """
+    source = tmp_path / f"terminal_{dark}.png"
+    make_terminal_chart(dark=dark).save(source)
+    result = engine.embed(source, tmp_path / f"marked_{dark}.png", PAYLOAD)
+
+    with Image.open(result.path) as image:
+        attacked = jpeg(image, quality)
+    assert engine.extract(to_bgr(attacked), result.size) == PAYLOAD
+
+
+def test_flat_chart_survives_screenshot_chain(engine: WatermarkEngine, tmp_path: Path) -> None:
+    source = tmp_path / "terminal.png"
+    make_terminal_chart().save(source)
+    result = engine.embed(source, tmp_path / "marked.png", PAYLOAD)
+
+    with Image.open(result.path) as image:
+        attacked = jpeg(rescale(jpeg(jpeg(image, 87), 80), 0.5), 90)
+    assert engine.extract(to_bgr(attacked), result.size) == PAYLOAD
+
+
+# --- Поиск урока --------------------------------------------------------------
+
+
+def test_coarse_grid_contains_identity_scale() -> None:
+    """Утёкшую картинку чаще всего пересылают как есть — масштаб ровно 100%."""
+    assert 100 in coarse_percents()
+
+
+def test_locate_finds_forwarded_copy(engine: WatermarkEngine, tmp_path: Path) -> None:
+    """Копия 1-в-1 обязана опознаваться уверенно, а не на уровне шума."""
+    source = tmp_path / "terminal.png"
+    make_terminal_chart().save(source)
+    result = engine.embed(source, tmp_path / "marked.png", PAYLOAD)
+
+    with Image.open(result.path) as image:
+        forwarded = to_bgr(jpeg(image, 87))
+
+    match = locate(forwarded, source)
+    assert match is not None
+    assert match.confidence > 0.9, f"совпадение всего {match.confidence:.0%}"
+    assert match.box[2:] == result.size
+    assert engine.extract(match.crop, result.size) == PAYLOAD
