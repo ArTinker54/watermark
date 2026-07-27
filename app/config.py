@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -65,6 +66,20 @@ class Settings(BaseSettings):
         description="Порог совпадения template match, ниже которого урок не рассматривается",
     )
     log_level: str = Field(default="INFO")
+
+    @field_validator(
+        "vsa_group_id", "db_path", "storage_path", "offer_path", mode="before"
+    )
+    @classmethod
+    def _blank_means_default(cls, value: Any, info: ValidationInfo) -> Any:
+        """Пустая строка в .env — это «не задано», а не значение.
+
+        Без этого закомментировать переменную нельзя: строка ``VSA_GROUP_ID=``
+        роняет запуск на разборе int, хотя ровно так выключение и выглядит.
+        """
+        if isinstance(value, str) and not value.strip():
+            return cls.model_fields[str(info.field_name)].default
+        return value
 
     @field_validator("db_path", "storage_path", "offer_path", mode="after")
     @classmethod
