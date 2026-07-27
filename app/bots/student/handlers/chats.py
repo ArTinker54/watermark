@@ -25,15 +25,32 @@ _GROUP_TYPES = frozenset({"group", "supergroup"})
 _CAN_CHECK_MEMBERS = frozenset({"administrator", "creator"})
 
 
+def _may_ask_group_id(message: Message, settings: Settings) -> bool:
+    """Автор курса или анонимный администратор ЭТОЙ группы.
+
+    Анонимный админ пишет от имени самой группы: Telegram подменяет отправителя
+    служебным ботом, а настоящего прячет, — проверка по Telegram ID тут не
+    работает в принципе. Зато ``sender_chat``, равный самому чату, бывает только
+    у его администратора, и этого достаточно: id группы не секрет, он ничего
+    не открывает сам по себе.
+
+    Сообщение от связанного канала сюда не попадает: у него ``sender_chat``
+    другой.
+    """
+    if message.sender_chat is not None and message.sender_chat.id == message.chat.id:
+        return True
+    user = message.from_user
+    return user is not None and user.id in settings.admin_id_set
+
+
 @router.message(Command("groupid"), F.chat.type.in_(_GROUP_TYPES))
 async def handle_group_id(message: Message, settings: Settings) -> None:
-    """Показать id чата. Только автору курса — остальным бот в группе молчит.
+    """Показать id чата. Только администратору — остальным бот в группе молчит.
 
     Событие о добавлении в группу приходит один раз и только если бот уже
     работал в этот момент; команда же доступна всегда.
     """
-    user = message.from_user
-    if user is None or user.id not in settings.admin_id_set:
+    if not _may_ask_group_id(message, settings):
         return
 
     await message.reply(

@@ -66,9 +66,12 @@ async def test_warns_when_bot_is_not_admin(caplog: pytest.LogCaptureFixture) -> 
 
 
 class _FakeGroupMessage:
-    def __init__(self, chat: Chat, user_id: int) -> None:
+    def __init__(
+        self, chat: Chat, user_id: int | None = None, sender_chat: Chat | None = None
+    ) -> None:
         self.chat = chat
-        self.from_user = _FakeUser(user_id)
+        self.from_user = _FakeUser(user_id) if user_id is not None else None
+        self.sender_chat = sender_chat
         self.replies: list[str] = []
 
     async def reply(self, text: str) -> None:
@@ -101,6 +104,27 @@ async def test_groupid_ignores_everyone_else() -> None:
     """Посторонний в группе не должен даже узнать, что бот отвечает на команды."""
     chat = Chat(id=-100999, type="supergroup", title="VSA PRO")
     message = _FakeGroupMessage(chat, user_id=555)
+    await handle_group_id(message, _settings("987"))
+    assert message.replies == []
+
+
+async def test_groupid_answers_anonymous_admin() -> None:
+    """В больших группах админы часто пишут анонимно — от имени самой группы.
+
+    Telegram подменяет отправителя служебным ботом, поэтому проверка по
+    Telegram ID тут не срабатывает в принципе.
+    """
+    chat = Chat(id=-1001234567890, type="supergroup", title="VSA PRO")
+    message = _FakeGroupMessage(chat, user_id=1087968824, sender_chat=chat)
+    await handle_group_id(message, _settings("987"))
+    assert "VSA_GROUP_ID=-1001234567890" in message.replies[0]
+
+
+async def test_groupid_ignores_linked_channel() -> None:
+    """Сообщение от связанного канала — не администратор группы."""
+    chat = Chat(id=-1001234567890, type="supergroup", title="VSA PRO")
+    channel = Chat(id=-1009999999999, type="channel", title="Метод VSA")
+    message = _FakeGroupMessage(chat, user_id=1087968824, sender_chat=channel)
     await handle_group_id(message, _settings("987"))
     assert message.replies == []
 
