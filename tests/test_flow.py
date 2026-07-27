@@ -256,6 +256,53 @@ async def test_tiny_preview_reports_size_not_false_match(
     assert "занимает" in result.reason and "%" in result.reason
 
 
+@pytest.mark.parametrize("keep", [0.8, 0.5])
+async def test_cropped_leak_is_still_traced(
+    database,
+    storage: Storage,
+    engine: WatermarkEngine,
+    settings: Settings,
+    lesson_source: Path,
+    keep: float,
+) -> None:
+    """От урока отрезали часть — виновник всё равно должен определяться.
+
+    Без восстановления геометрии обрезка ломает трассировку полностью, даже
+    когда срезали десятую долю: сетка блоков уезжает целиком.
+    """
+    student = await _register(database, 9001 + int(keep * 100), "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session, storage, admin_tg_id=1, caption=None, staged=[lesson_source]
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / f"outbox_{keep}")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    with Image.open(bot.delivered_to(student.tg_user_id)[0]) as delivered:
+        side = keep**0.5
+        width, height = int(delivered.width * side), int(delivered.height * side)
+        left, top = (delivered.width - width) // 2, (delivered.height - height) // 2
+        piece = delivered.crop((left, top, left + width, top + height))
+
+    leak = settings.storage_path / f"cropped_{keep}.png"
+    jpeg(piece, 90).save(leak)
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(leak, admin_tg_id=1)
+
+    assert isinstance(result, TraceHit), getattr(result, "reason", result)
+    assert result.payload == Payload(uid=student.uid, lesson_id=lesson.id)
+    assert result.student is not None and result.student.tg_user_id == student.tg_user_id
+
+
 async def test_unrelated_image_is_not_attributed(
     database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
 ) -> None:

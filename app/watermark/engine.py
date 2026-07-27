@@ -132,6 +132,19 @@ class CoarseMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class Rebuilt:
+    """Обрезок, возвращённый в геометрию оригинала."""
+
+    image: BgrImage
+    confidence: float
+    box: tuple[int, int, int, int]
+    """Куда в оригинале лёг обрезок: (x, y, width, height)."""
+
+    coverage: float
+    """Какая доля площади оригинала уцелела. Ниже ~0.35 метка уже не собирается."""
+
+
+@dataclass(frozen=True, slots=True)
 class LocateMatch:
     """Найденная на скриншоте область урока."""
 
@@ -449,6 +462,52 @@ def locate(
 
 
 # --- Async-обёртки -------------------------------------------------------------
+
+
+def rebuild_fragment(
+    fragment: Path | BgrImage,
+    original: Path | BgrImage,
+    *,
+    hint: CoarseMatch | None = None,
+) -> Rebuilt | None:
+    """Вернуть обрезанную картинку в геометрию оригинала.
+
+    Если у утёкшей картинки отрезали часть, простое растягивание к размеру
+    оригинала сдвигает всю сетку блоков и метка не собирается — даже когда
+    срезали всего десятую долю. Здесь обрезок ищется ВНУТРИ пристинного
+    оригинала (поиск наоборот: шаблон — обрезок, сцена — оригинал), масштаб
+    и место восстанавливаются, и обрезок вклеивается ровно на своё место.
+
+    Уцелевшие блоки после этого лежат там же, где при встраивании. Недостающие
+    заполняются пикселями оригинала — метки в них нет, и они дают шум, но она
+    вписана циклически и усредняется по всем блокам, так что запаса хватает
+    примерно до трети сохранившейся площади.
+    """
+    piece = load_bgr(fragment) if isinstance(fragment, Path) else fragment
+    canvas = (load_bgr(original) if isinstance(original, Path) else original).copy()
+
+    match = locate(canvas, piece, hint=hint)
+    if match is None:
+        return None
+
+    x, y, width, height = match.box
+    canvas[y : y + height, x : x + width] = resize_to(piece, (width, height))
+    total = canvas.shape[0] * canvas.shape[1]
+    return Rebuilt(
+        image=canvas,
+        confidence=match.confidence,
+        box=match.box,
+        coverage=(width * height) / max(total, 1),
+    )
+
+
+async def rebuild_fragment_async(
+    fragment: Path | BgrImage,
+    original: Path | BgrImage,
+    *,
+    hint: CoarseMatch | None = None,
+) -> Rebuilt | None:
+    return await asyncio.to_thread(rebuild_fragment, fragment, original, hint=hint)
 
 
 async def embed_async(

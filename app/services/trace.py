@@ -34,10 +34,15 @@ from app.watermark import (
     load_bgr,
     locate_async,
     locate_coarse_async,
+    rebuild_fragment_async,
 )
 from app.watermark.engine import BgrImage
 
 logger = logging.getLogger(__name__)
+
+#: Выше этого совпадения считаем, что урок на картинке опознан уверенно, —
+#: только тогда можно называть конкретную причину отказа.
+_CONFIDENT_MATCH = 0.6
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,11 +127,24 @@ class TraceService:
             await self._log(admin_tg_id, suspect_path, result)
             return result
 
-        candidates = await self._rank(suspect, pairs)
         attempts: list[_Attempt] = []
 
+        # Проход 1 — урок целиком виден на присланной картинке (скриншот).
+        candidates = await self._rank(suspect, pairs)
         for candidate in candidates[: self._max_candidates]:
             attempt = await self._try_candidate(suspect, candidate)
+            if attempt is None:
+                continue
+            if attempt.hit is not None:
+                await self._log(admin_tg_id, suspect_path, attempt.hit)
+                return attempt.hit
+            attempts.append(attempt)
+
+        # Проход 2 — от урока отрезали часть. Тогда прямой поиск бесполезен:
+        # шаблона целиком на картинке нет. Ищем наоборот — обрезок внутри
+        # оригинала — и восстанавливаем геометрию.
+        for candidate in await self._rank_fragments(suspect, pairs):
+            attempt = await self._try_fragment(suspect, candidate)
             if attempt is None:
                 continue
             if attempt.hit is not None:
@@ -149,7 +167,10 @@ class TraceService:
             )
 
         best = max(attempts, key=lambda item: item.confidence)
-        if best.scale < READABLE_SCALE:
+        # Про «слишком мелко» говорим, только если урок действительно опознан.
+        # На слабом совпадении это была бы уверенно названная неверная причина,
+        # а в трассировке такое хуже честного «не знаю».
+        if best.scale < READABLE_SCALE and best.confidence > _CONFIDENT_MATCH:
             reason = (
                 f"урок найден, но на присланной картинке он занимает всего "
                 f"{best.found_size[0]}×{best.found_size[1]} — это "
@@ -201,6 +222,87 @@ class TraceService:
         # проходит сверку lesson_id и наличия ученика.
         return above or found[:1]
 
+    async def _rank_fragments(
+        self, suspect: BgrImage, pairs: list[tuple[Lesson, LessonImage]]
+    ) -> list[_Candidate]:
+        """Ранжирование для обрезка: ищем присланное ВНУТРИ оригиналов."""
+
+        async def scan(lesson: Lesson, image: LessonImage) -> _Candidate | None:
+            path = Path(image.path)
+            if not path.exists():  # noqa: ASYNC240 - локальная ФС, микросекунды
+                return None
+            coarse = await locate_coarse_async(path, suspect)
+            if coarse is None or coarse.confidence < self._min_confidence:
+                return None
+            return _Candidate(lesson=lesson, image=image, coarse=coarse)
+
+        scanned = await asyncio.gather(*(scan(lesson, image) for lesson, image in pairs))
+        found = [item for item in scanned if item is not None]
+        found.sort(key=lambda item: item.coarse.confidence, reverse=True)
+        return found[: self._max_candidates]
+
+    async def _try_fragment(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:
+        original = Path(candidate.image.path)
+        rebuilt = await rebuild_fragment_async(suspect, original, hint=candidate.coarse)
+        if rebuilt is None:
+            return None
+
+        size = candidate.image.size
+        found = (rebuilt.box[2], rebuilt.box[3])
+        attempt = _Attempt(
+            hit=None,
+            confidence=rebuilt.confidence,
+            found_size=found,
+            original_size=size,
+            lesson_id=candidate.lesson.id,
+        )
+
+        payload = await asyncio.to_thread(self._engine.extract, rebuilt.image, size)
+        if payload is None or payload.lesson_id != candidate.lesson.id:
+            return attempt
+
+        logger.info(
+            "метка собрана из обрезка: урок %d, уцелело %.0f%% площади",
+            candidate.lesson.id,
+            rebuilt.coverage * 100,
+        )
+        hit = await self._build_hit(
+            candidate, payload, confidence=rebuilt.confidence, box=rebuilt.box
+        )
+        return _Attempt(
+            hit=hit,
+            confidence=rebuilt.confidence,
+            found_size=found,
+            original_size=size,
+            lesson_id=candidate.lesson.id,
+        )
+
+    async def _build_hit(
+        self,
+        candidate: _Candidate,
+        payload: Payload,
+        *,
+        confidence: float,
+        box: tuple[int, int, int, int],
+    ) -> TraceHit:
+        async with self._session_factory() as session:
+            student = await get_student_by_uid(session, payload.uid)
+            confirmed = False
+            if student is not None:
+                delivery = await get_delivery(
+                    session, lesson_id=candidate.lesson.id, student_id=student.id
+                )
+                confirmed = delivery is not None and delivery.wm_payload == payload.encode()
+
+        return TraceHit(
+            payload=payload,
+            lesson=candidate.lesson,
+            student=student,
+            confidence=confidence,
+            box=box,
+            delivery_confirmed=confirmed,
+        )
+
     async def _try_candidate(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:
         original = Path(candidate.image.path)
         match = await locate_async(suspect, original, hint=candidate.coarse)
@@ -232,22 +334,8 @@ class TraceService:
             )
             return attempt
 
-        async with self._session_factory() as session:
-            student = await get_student_by_uid(session, payload.uid)
-            confirmed = False
-            if student is not None:
-                delivery = await get_delivery(
-                    session, lesson_id=candidate.lesson.id, student_id=student.id
-                )
-                confirmed = delivery is not None and delivery.wm_payload == payload.encode()
-
-        hit = TraceHit(
-            payload=payload,
-            lesson=candidate.lesson,
-            student=student,
-            confidence=match.confidence,
-            box=match.box,
-            delivery_confirmed=confirmed,
+        hit = await self._build_hit(
+            candidate, payload, confidence=match.confidence, box=match.box
         )
         return _Attempt(
             hit=hit,

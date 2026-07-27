@@ -9,6 +9,7 @@ from app.watermark.engine import (
     CoarseMatch,
     EmbedResult,
     LocateMatch,
+    Rebuilt,
     WatermarkEngine,
     WatermarkError,
     embed_async,
@@ -19,6 +20,8 @@ from app.watermark.engine import (
     locate_async,
     locate_coarse,
     locate_coarse_async,
+    rebuild_fragment,
+    rebuild_fragment_async,
     save_bgr,
 )
 from app.watermark.payload import (
@@ -42,6 +45,7 @@ __all__ = [
     "EmbedResult",
     "LocateMatch",
     "Payload",
+    "Rebuilt",
     "WatermarkEngine",
     "WatermarkError",
     "bit_length",
@@ -53,5 +57,7 @@ __all__ = [
     "locate_async",
     "locate_coarse",
     "locate_coarse_async",
+    "rebuild_fragment",
+    "rebuild_fragment_async",
     "save_bgr",
 ]
