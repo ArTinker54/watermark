@@ -13,6 +13,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
@@ -82,21 +83,34 @@ async def main() -> None:
     dispatcher.update.outer_middleware(DbSessionMiddleware(database.session_factory))
     dispatcher.include_router(build_router())
 
-    me = await bot.get_me()
-    student_me = await student_bot.get_me()
-    logger.info(
-        "admin-bot запущен: @%s, раздача через @%s, метка %d бит",
-        me.username,
-        student_me.username,
-        WM_BIT_LENGTH,
-    )
-    await bot.set_my_commands(_COMMANDS)
-
     try:
+        try:
+            me = await bot.get_me()
+        except TelegramUnauthorizedError:
+            logger.error("Telegram отклонил ADMIN_BOT_TOKEN — проверьте .env")
+            raise SystemExit(1) from None
+        try:
+            student_me = await student_bot.get_me()
+        except TelegramUnauthorizedError:
+            logger.error(
+                "Telegram отклонил STUDENT_BOT_TOKEN — проверьте .env. "
+                "Без него admin-бот не сможет раздавать уроки."
+            )
+            raise SystemExit(1) from None
+
+        logger.info(
+            "admin-bot запущен: @%s, раздача через @%s, метка %d бит",
+            me.username,
+            student_me.username,
+            WM_BIT_LENGTH,
+        )
+        await bot.set_my_commands(_COMMANDS)
         await dispatcher.start_polling(
             bot, allowed_updates=dispatcher.resolve_used_update_types()
         )
     finally:
+        # Закрывать надо и при падении на старте, иначе aiohttp ругается
+        # на незакрытую сессию поверх настоящей причины ошибки.
         await bot.session.close()
         await student_bot.session.close()
         await database.dispose()
