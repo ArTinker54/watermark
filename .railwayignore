@@ -1,0 +1,14 @@
+# Что не нужно отправлять на сборщик Railway.
+# Секреты задаются переменными сервиса, а не файлом.
+.env
+.venv
+venv
+.git
+data
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
