@@ -115,6 +115,7 @@ class LessonBroadcaster:
         session_factory: async_sessionmaker[AsyncSession],
         rate_interval: float,
         workers: int,
+        protect_content: bool = True,
     ) -> None:
         self._bot = bot
         self._engine = engine
@@ -122,6 +123,7 @@ class LessonBroadcaster:
         self._session_factory = session_factory
         self._limiter = RateLimiter(rate_interval)
         self._embed_slots = asyncio.Semaphore(workers)
+        self._protect = protect_content
 
     async def run(
         self,
@@ -207,6 +209,7 @@ class LessonBroadcaster:
                 chat_id=chat_id,
                 photo=FSInputFile(images[0]),
                 caption=inline_caption,
+                protect_content=self._protect,
             )
             message_id: int | None = message.message_id
         else:
@@ -217,12 +220,22 @@ class LessonBroadcaster:
                 )
                 for index, path in enumerate(images)
             ]
-            sent = await self._call(self._bot.send_media_group, chat_id=chat_id, media=media)
+            sent = await self._call(
+                self._bot.send_media_group,
+                chat_id=chat_id,
+                media=media,
+                protect_content=self._protect,
+            )
             message_id = sent[0].message_id if sent else None
 
         if caption and inline_caption is None:
             for chunk in _split_text(caption):
-                await self._call(self._bot.send_message, chat_id=chat_id, text=chunk)
+                await self._call(
+                    self._bot.send_message,
+                    chat_id=chat_id,
+                    text=chunk,
+                    protect_content=self._protect,
+                )
 
         return message_id
 

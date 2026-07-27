@@ -59,6 +59,14 @@ class Settings(BaseSettings):
         ge=1,
         description="Сколько картинок метить параллельно",
     )
+    protect_content: bool = Field(
+        default=True,
+        description=(
+            "Запретить пересылку и сохранение выданных материалов. Скриншот при этом "
+            "блокируется только на Android: iOS и десктоп такого запрета не умеют — "
+            "именно их и закрывает метка."
+        ),
+    )
     trace_min_confidence: float = Field(
         default=0.35,
         ge=0.0,

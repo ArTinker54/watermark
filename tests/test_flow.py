@@ -42,6 +42,7 @@ class SentMessage:
     path: Path | None
     caption: str | None
     text: str | None = None
+    protected: bool = False
 
 
 class FakeBot:
@@ -60,22 +61,49 @@ class FakeBot:
         return target
 
     async def send_photo(
-        self, chat_id: int, photo: Any, caption: str | None = None
+        self,
+        chat_id: int,
+        photo: Any,
+        caption: str | None = None,
+        protect_content: bool = False,
     ) -> _FakeResult:
         stored = self._store(chat_id, Path(photo.path))
-        self.sent.append(SentMessage(chat_id=chat_id, path=stored, caption=caption))
+        self.sent.append(
+            SentMessage(
+                chat_id=chat_id, path=stored, caption=caption, protected=protect_content
+            )
+        )
         return _FakeResult(len(self.sent))
 
-    async def send_media_group(self, chat_id: int, media: list[Any]) -> list[_FakeResult]:
+    async def send_media_group(
+        self, chat_id: int, media: list[Any], protect_content: bool = False
+    ) -> list[_FakeResult]:
         results: list[_FakeResult] = []
         for item in media:
             stored = self._store(chat_id, Path(item.media.path))
-            self.sent.append(SentMessage(chat_id=chat_id, path=stored, caption=item.caption))
+            self.sent.append(
+                SentMessage(
+                    chat_id=chat_id,
+                    path=stored,
+                    caption=item.caption,
+                    protected=protect_content,
+                )
+            )
             results.append(_FakeResult(len(self.sent)))
         return results
 
-    async def send_message(self, chat_id: int, text: str) -> Any:
-        self.sent.append(SentMessage(chat_id=chat_id, path=None, caption=None, text=text))
+    async def send_message(
+        self, chat_id: int, text: str, protect_content: bool = False
+    ) -> Any:
+        self.sent.append(
+            SentMessage(
+                chat_id=chat_id,
+                path=None,
+                caption=None,
+                text=text,
+                protected=protect_content,
+            )
+        )
         return _FakeResult(len(self.sent))
 
     def delivered_to(self, chat_id: int) -> list[Path]:
@@ -143,6 +171,7 @@ def _broadcaster(bot: FakeBot, engine: WatermarkEngine, storage: Storage, databa
         session_factory=database.session_factory,
         rate_interval=settings.send_interval,
         workers=settings.wm_workers,
+        protect_content=settings.protect_content,
     )
 
 
@@ -268,6 +297,39 @@ async def test_tiny_preview_reports_size_not_false_match(
     assert result.best_lesson_id == lesson.id, "урок должен быть опознан, пусть метка и не читается"
     assert result.scale is not None and result.scale < READABLE_SCALE
     assert "занимает" in result.reason and "%" in result.reason
+
+
+async def test_delivered_material_is_protected(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Пересылку и сохранение закрываем на стороне Telegram.
+
+    Это снимает самый лёгкий путь утечки — переслать файл в один клик.
+    Скриншот остаётся возможен на iOS и десктопе, его и ловит метка.
+    """
+    long_caption = "Разбор урока. " * 120  # длиннее лимита подписи — уйдёт отдельно
+    student = await _register(database, 9500, "Алиса")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=long_caption,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_protect")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    sent = [item for item in bot.sent if item.chat_id == student.tg_user_id]
+    assert sent, "ученику ничего не ушло"
+    # И картинка, и вынесенный отдельно длинный текст должны быть защищены.
+    assert all(item.protected for item in sent)
+    assert any(item.path for item in sent) and any(item.text for item in sent)
 
 
 async def test_lesson_image_is_capped(

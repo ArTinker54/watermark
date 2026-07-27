@@ -44,6 +44,7 @@ def build_admin(settings: Settings, database: Database, *, student_bot: Bot) -> 
         session_factory=database.session_factory,
         rate_interval=settings.send_interval,
         workers=settings.wm_workers,
+        protect_content=settings.protect_content,
     )
     dispatcher["tracer"] = TraceService(
         engine=engine,
