@@ -11,5 +11,6 @@ __pycache__
 data
 tests
 .env
+.env.example
 *.md
 !README.md

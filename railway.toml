@@ -1,0 +1,17 @@
+# Railway: один сервис, оба бота в одном процессе.
+#
+# Так сделано не от хорошей жизни: том Railway монтируется ровно к одному
+# сервису, а базу и пристинные оригиналы уроков боты обязаны делить — без
+# оригиналов не работает трассировка. Разнести их по двум сервисам можно
+# было бы только с внешней БД и объектным хранилищем.
+#
+# Том нужно примонтировать в /data (Railway → Service → Variables → Volume).
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -m app.bots.combined"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

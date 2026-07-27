@@ -1,0 +1,43 @@
+"""Сборка student-бота — отдельно от точки входа, чтобы его можно было
+поднять и одним процессом вместе с admin-ботом (см. ``app.bots.combined``)."""
+
+from __future__ import annotations
+
+from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
+
+from app.bots.middlewares import DbSessionMiddleware
+from app.bots.runtime import BotRuntime, make_bot
+from app.bots.student.handlers import build_router
+from app.config import Settings
+from app.db import Database
+
+COMMANDS = [
+    BotCommand(command="start", description="Регистрация и условия"),
+    BotCommand(command="id", description="Мой номер участника"),
+    BotCommand(command="offer", description="Условия доступа"),
+    BotCommand(command="help", description="Справка"),
+]
+
+
+def build_student(
+    settings: Settings, database: Database, *, bot: Bot | None = None
+) -> BotRuntime:
+    """``bot`` передают, когда объект уже создан для рассылки, — чтобы не
+    держать два подключения к одному и тому же боту."""
+    owns_session = bot is None
+    bot = bot or make_bot(settings.student_bot_token)
+
+    dispatcher = Dispatcher()
+    dispatcher["settings"] = settings
+    dispatcher.update.outer_middleware(DbSessionMiddleware(database.session_factory))
+    dispatcher.include_router(build_router())
+
+    return BotRuntime(
+        name="student-bot",
+        token_env="STUDENT_BOT_TOKEN",
+        bot=bot,
+        dispatcher=dispatcher,
+        commands=COMMANDS,
+        owns_session=owns_session,
+    )
