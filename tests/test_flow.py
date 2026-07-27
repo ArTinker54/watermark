@@ -25,7 +25,15 @@ from app.db.repo import (
 from app.services import LessonBroadcaster, LessonSpec, Storage, TraceHit, TraceMiss, TraceService
 from app.services.lessons import save_lesson
 from app.watermark import READABLE_SCALE, Payload, WatermarkEngine
-from tests.conftest import PW_IMG, PW_WM, desktop_screenshot, jpeg, make_chart, screenshot
+from tests.conftest import (
+    PW_IMG,
+    PW_WM,
+    desktop_screenshot,
+    jpeg,
+    make_chart,
+    make_terminal_chart,
+    screenshot,
+)
 
 
 @dataclass
@@ -179,6 +187,7 @@ async def test_full_flow_delivery_and_trace(
             admin_tg_id=1,
             caption="Урок 1: объёмы и спред",
             staged=[lesson_source],
+            max_side=settings.lesson_max_side,
         )
         students = list(await list_active_students(session))
 
@@ -229,7 +238,12 @@ async def test_tiny_preview_reports_size_not_false_match(
     student = await _register(database, 8001, "Алиса")
     async with database.session_factory() as session:
         lesson = await save_lesson(
-            session, storage, admin_tg_id=1, caption=None, staged=[lesson_source]
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
         )
         students = list(await list_active_students(session))
 
@@ -256,6 +270,85 @@ async def test_tiny_preview_reports_size_not_false_match(
     assert "занимает" in result.reason and "%" in result.reason
 
 
+async def test_lesson_image_is_capped(
+    database, storage: Storage, settings: Settings, tmp_path: Path
+) -> None:
+    """Длинная сторона урока ограничивается — иначе метка не переживёт ленту чата."""
+    tall = tmp_path / "tall.png"
+    make_terminal_chart(589, 1280, seed=5).save(tall)
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[tall],
+            max_side=settings.lesson_max_side,
+        )
+
+    image = lesson.images[0]
+    assert max(image.width, image.height) == settings.lesson_max_side
+    assert image.width / image.height == pytest.approx(589 / 1280, abs=0.01)
+
+
+async def test_small_image_is_not_upscaled(database, storage: Storage, tmp_path: Path) -> None:
+    small = tmp_path / "small.png"
+    make_terminal_chart(300, 420, seed=2).save(small)
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session, storage, admin_tg_id=1, caption=None, staged=[small], max_side=800
+        )
+    assert (lesson.images[0].width, lesson.images[0].height) == (300, 420)
+
+
+async def test_chat_preview_screenshot_is_traced(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, tmp_path: Path
+) -> None:
+    """Скриншот ленты чата — самый обычный способ слить материал.
+
+    Telegram показывает вертикальное фото уменьшенным независимо от его размера,
+    поэтому урок и ограничивается по длинной стороне: иначе на скриншоте видно
+    всего ~38% оригинала, и метки там уже нет.
+    """
+    tall = tmp_path / "tall.png"
+    make_terminal_chart(589, 1280, seed=5).save(tall)
+
+    student = await _register(database, 8500, "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[tall],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_chat")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    # Так Telegram Desktop показывает вертикальное фото в ленте (замерено).
+    with Image.open(bot.delivered_to(student.tg_user_id)[0]) as delivered:
+        shown = delivered.resize((225, 489), Image.Resampling.LANCZOS)
+    leak = settings.storage_path / "chat_preview.png"
+    jpeg(shown, 90).save(leak)
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(leak, admin_tg_id=1)
+
+    assert isinstance(result, TraceHit), getattr(result, "reason", result)
+    assert result.payload == Payload(uid=student.uid, lesson_id=lesson.id)
+
+
 @pytest.mark.parametrize("keep", [0.8, 0.5])
 async def test_cropped_leak_is_still_traced(
     database,
@@ -273,7 +366,12 @@ async def test_cropped_leak_is_still_traced(
     student = await _register(database, 9001 + int(keep * 100), "Борис")
     async with database.session_factory() as session:
         lesson = await save_lesson(
-            session, storage, admin_tg_id=1, caption=None, staged=[lesson_source]
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
         )
         students = list(await list_active_students(session))
 
@@ -310,7 +408,12 @@ async def test_unrelated_image_is_not_attributed(
     await _register(database, 6001, "Алиса")
     async with database.session_factory() as session:
         await save_lesson(
-            session, storage, admin_tg_id=1, caption=None, staged=[lesson_source]
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
         )
 
     stranger = settings.storage_path / "stranger.png"
@@ -341,7 +444,12 @@ async def test_partial_extraction_is_rejected(
     student = await _register(database, 7001, "Алиса")
     async with database.session_factory() as session:
         lesson = await save_lesson(
-            session, storage, admin_tg_id=1, caption=None, staged=[lesson_source]
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
         )
 
     wrong = Payload(uid=student.uid, lesson_id=lesson.id + 500)

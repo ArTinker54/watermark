@@ -19,9 +19,11 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bots.files import ImageRejected, download_image, extract_file_id
+from app.config import Settings
 from app.db.repo import list_active_students
 from app.services import LessonBroadcaster, LessonSpec, Storage, save_lesson
 from app.utils import CAPTION_LIMIT, split_text
+from app.watermark import image_size
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +110,9 @@ async def collect_caption(message: Message, state: FSMContext) -> None:
 
 
 @router.message(NewLesson.collecting, Command("done"))
-async def finish_collecting(message: Message, state: FSMContext, session: AsyncSession) -> None:
+async def finish_collecting(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
     data = await state.get_data()
     images = [Path(item) for item in data.get("images", [])]
     if not images:
@@ -134,11 +138,17 @@ async def finish_collecting(message: Message, state: FSMContext, session: AsyncS
         for chunk in split_text(caption):
             await message.answer(chunk)
 
-    await message.answer(
-        f"Картинок: {len(images)}\nПолучателей: {len(students)}\n\n"
-        "Каждый получит свою копию с личной меткой.",
-        reply_markup=_confirm_keyboard(len(students)),
-    )
+    lines = [f"Картинок: {len(images)}", f"Получателей: {len(students)}"]
+    oversized = [path for path in images if max(image_size(path)) > settings.lesson_max_side]
+    if oversized:
+        # Не сюрприз, а осознанный компромисс — автор должен о нём знать.
+        lines.append(
+            f"\nДлинная сторона будет уменьшена до {settings.lesson_max_side} px: "
+            "иначе метка не читается со скриншота чата."
+        )
+    lines.append("\nКаждый получит свою копию с личной меткой.")
+
+    await message.answer("\n".join(lines), reply_markup=_confirm_keyboard(len(students)))
 
 
 @router.callback_query(NewLesson.confirming, F.data == SEND_CALLBACK)
@@ -148,6 +158,7 @@ async def send_lesson(
     session: AsyncSession,
     storage: Storage,
     broadcaster: LessonBroadcaster,
+    settings: Settings,
 ) -> None:
     await callback.answer()
     message = callback.message
@@ -169,6 +180,7 @@ async def send_lesson(
         admin_tg_id=callback.from_user.id,
         caption=caption,
         staged=staged,
+        max_side=settings.lesson_max_side,
     )
     Storage.drop_staging(Path(data["staging"]))
     await state.clear()

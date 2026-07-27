@@ -65,6 +65,16 @@ class Settings(BaseSettings):
         le=1.0,
         description="Порог совпадения template match, ниже которого урок не рассматривается",
     )
+    lesson_max_side: int = Field(
+        default=800,
+        ge=200,
+        le=4096,
+        description=(
+            "Потолок длинной стороны картинки урока. Telegram показывает фото в ленте "
+            "уменьшенным независимо от его размера, поэтому чем меньше оригинал, тем "
+            "большую его долю видно на скриншоте чата — и тем надёжнее читается метка."
+        ),
+    )
     log_level: str = Field(default="INFO")
 
     @field_validator(
