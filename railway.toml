@@ -12,6 +12,9 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python -m app.bots.combined"
+# Через энтрипоинт явно: свой start command может обойти ENTRYPOINT образа,
+# а без него некому выставить владельца тома. Вложенный вызов безопасен —
+# скрипт под непривилегированным пользователем просто запускает команду.
+startCommand = "docker-entrypoint.sh python -m app.bots.combined"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
