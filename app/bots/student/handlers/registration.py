@@ -24,6 +24,9 @@ from app.utils import split_text
 logger = logging.getLogger(__name__)
 
 router = Router(name="registration")
+# Бот живёт и в группе курса (там он проверяет членство), но разговаривать
+# должен только в личке: иначе /start вывалил бы текст оферты в общий чат.
+router.message.filter(F.chat.type == "private")
 
 CONSENT_CALLBACK = "offer:accept"
 

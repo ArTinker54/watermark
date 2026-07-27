@@ -13,6 +13,8 @@ from app.texts import load_offer
 from app.utils import split_text
 
 router = Router(name="common")
+# Только личка: в группе бот молчит, см. registration.py.
+router.message.filter(F.chat.type == "private")
 
 _NOT_REGISTERED = "Вы ещё не приняли условия. Нажмите /start, чтобы получить доступ."
 
