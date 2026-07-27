@@ -168,6 +168,30 @@ def screenshot(
     return shot
 
 
+def desktop_screenshot(
+    chart: Image.Image,
+    scale: float,
+    *,
+    canvas: tuple[int, int] = (1920, 1080),
+    offset: tuple[int, int] = (360, 120),
+) -> Image.Image:
+    """Снимок ВСЕГО экрана: график лежит превьюшкой внутри окна мессенджера.
+
+    Это худший реальный случай — именно так выглядит скриншот рабочего стола,
+    где картинка урока занимает считаные проценты кадра.
+    """
+    shot = Image.new("RGB", canvas, (24, 27, 33))
+    draw = ImageDraw.Draw(shot)
+    draw.rectangle([0, 0, 300, canvas[1]], fill=(31, 35, 42))
+    draw.rectangle([0, 0, canvas[0], 46], fill=(37, 41, 48))
+    for i in range(14):
+        y = 70 + i * 62
+        draw.ellipse([16, y, 52, y + 36], fill=(70, 80, 95))
+        draw.rectangle([64, y + 6, 280, y + 16], fill=(60, 68, 80))
+    shot.paste(rescale(chart, scale), offset)
+    return shot
+
+
 def to_bgr(image: Image.Image) -> np.ndarray:
     """PIL RGB -> BGR-массив для движка."""
     return np.asarray(image.convert("RGB"), dtype=np.uint8)[:, :, ::-1].copy()

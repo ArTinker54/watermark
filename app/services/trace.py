@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db import Lesson, LessonImage, Student
 from app.db.repo import get_delivery, get_student_by_uid, list_lessons, log_trace_attempt
 from app.watermark import (
+    READABLE_SCALE,
     CoarseMatch,
     Payload,
     WatermarkEngine,
@@ -60,6 +61,27 @@ class TraceMiss:
     checked: int
     best_confidence: float | None = None
     best_lesson_id: int | None = None
+    found_size: tuple[int, int] | None = None
+    """Размер области урока на присланной картинке, если её удалось найти."""
+
+    original_size: tuple[int, int] | None = None
+    scale: float | None = None
+    """Во сколько раз область меньше оригинала. < READABLE_SCALE — безнадёжно."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Attempt:
+    """Что дала попытка по одному кандидату — для объяснения отказа."""
+
+    hit: TraceHit | None
+    confidence: float
+    found_size: tuple[int, int]
+    original_size: tuple[int, int]
+    lesson_id: int
+
+    @property
+    def scale(self) -> float:
+        return self.found_size[0] / max(self.original_size[0], 1)
 
 
 TraceResult = TraceHit | TraceMiss
@@ -101,22 +123,55 @@ class TraceService:
             return result
 
         candidates = await self._rank(suspect, pairs)
-        best = candidates[0] if candidates else None
+        attempts: list[_Attempt] = []
 
         for candidate in candidates[: self._max_candidates]:
-            hit = await self._try_candidate(suspect, candidate)
-            if hit is not None:
-                await self._log(admin_tg_id, suspect_path, hit)
-                return hit
+            attempt = await self._try_candidate(suspect, candidate)
+            if attempt is None:
+                continue
+            if attempt.hit is not None:
+                await self._log(admin_tg_id, suspect_path, attempt.hit)
+                return attempt.hit
+            attempts.append(attempt)
 
-        result = TraceMiss(
-            reason=self._explain(best),
-            checked=len(pairs),
-            best_confidence=best.coarse.confidence if best else None,
-            best_lesson_id=best.lesson.id if best else None,
-        )
+        result = self._miss(attempts, checked=len(pairs))
         await self._log(admin_tg_id, suspect_path, result)
         return result
+
+    def _miss(self, attempts: list[_Attempt], *, checked: int) -> TraceMiss:
+        if not attempts:
+            return TraceMiss(
+                reason=(
+                    "не удалось сопоставить картинку ни с одним уроком — "
+                    "возможно, это не наш материал или он сильно обрезан"
+                ),
+                checked=checked,
+            )
+
+        best = max(attempts, key=lambda item: item.confidence)
+        if best.scale < READABLE_SCALE:
+            reason = (
+                f"урок найден, но на присланной картинке он занимает всего "
+                f"{best.found_size[0]}×{best.found_size[1]} — это "
+                f"{best.scale:.0%} от оригинала "
+                f"({best.original_size[0]}×{best.original_size[1]}). "
+                f"Метка восстанавливается примерно от {READABLE_SCALE:.0%}: "
+                "при таком уменьшении её уже физически нет в пикселях"
+            )
+        else:
+            reason = (
+                "урок найден, но метка не читается — скорее всего, картинку "
+                "слишком сильно пережали или обрезали"
+            )
+        return TraceMiss(
+            reason=reason,
+            checked=checked,
+            best_confidence=best.confidence,
+            best_lesson_id=best.lesson_id,
+            found_size=best.found_size,
+            original_size=best.original_size,
+            scale=best.scale,
+        )
 
     async def _rank(
         self, suspect: BgrImage, pairs: list[tuple[Lesson, LessonImage]]
@@ -146,20 +201,28 @@ class TraceService:
         # проходит сверку lesson_id и наличия ученика.
         return above or found[:1]
 
-    async def _try_candidate(self, suspect: BgrImage, candidate: _Candidate) -> TraceHit | None:
+    async def _try_candidate(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:
         original = Path(candidate.image.path)
         match = await locate_async(suspect, original, hint=candidate.coarse)
         if match is None:
             return None
 
         size = candidate.image.size
+        attempt = _Attempt(
+            hit=None,
+            confidence=match.confidence,
+            found_size=(match.box[2], match.box[3]),
+            original_size=size,
+            lesson_id=candidate.lesson.id,
+        )
+
         payload = await asyncio.to_thread(self._engine.extract, match.crop, size)
         if payload is None:
             # Запасной заход: утечка могла быть не скриншотом, а самим файлом,
             # который просто пережали — тогда кроп не нужен вовсе.
             payload = await asyncio.to_thread(self._engine.extract, suspect, size)
         if payload is None:
-            return None
+            return attempt
 
         if payload.lesson_id != candidate.lesson.id:
             logger.info(
@@ -167,7 +230,7 @@ class TraceService:
                 candidate.lesson.id,
                 payload.lesson_id,
             )
-            return None
+            return attempt
 
         async with self._session_factory() as session:
             student = await get_student_by_uid(session, payload.uid)
@@ -178,7 +241,7 @@ class TraceService:
                 )
                 confirmed = delivery is not None and delivery.wm_payload == payload.encode()
 
-        return TraceHit(
+        hit = TraceHit(
             payload=payload,
             lesson=candidate.lesson,
             student=student,
@@ -186,16 +249,12 @@ class TraceService:
             box=match.box,
             delivery_confirmed=confirmed,
         )
-
-    def _explain(self, best: _Candidate | None) -> str:
-        if best is None:
-            return (
-                "не удалось сопоставить картинку ни с одним уроком — "
-                "возможно, это не наш материал или он сильно обрезан"
-            )
-        return (
-            f"урок найден (совпадение {best.coarse.confidence:.0%}), но метка не читается — "
-            "скорее всего, картинку слишком сильно пережали или обрезали"
+        return _Attempt(
+            hit=hit,
+            confidence=match.confidence,
+            found_size=attempt.found_size,
+            original_size=size,
+            lesson_id=candidate.lesson.id,
         )
 
     async def _log(self, admin_tg_id: int, image_path: Path, result: TraceResult) -> None:

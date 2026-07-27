@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from app.watermark.engine import (
+    EMBED_STRENGTH,
+    EMBED_VERSION,
+    READABLE_SCALE,
     CoarseMatch,
     EmbedResult,
     LocateMatch,
@@ -30,7 +33,10 @@ from app.watermark.payload import (
 __all__ = [
     "MAX_LESSON_ID",
     "MAX_UID",
+    "EMBED_STRENGTH",
+    "EMBED_VERSION",
     "PAYLOAD_VERSION",
+    "READABLE_SCALE",
     "WM_BIT_LENGTH",
     "CoarseMatch",
     "EmbedResult",

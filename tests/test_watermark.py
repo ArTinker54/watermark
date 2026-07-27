@@ -20,6 +20,7 @@ from app.watermark.payload import WM_BIT_LENGTH
 from tests.conftest import (
     PW_IMG,
     PW_WM,
+    desktop_screenshot,
     flat_share,
     jpeg,
     make_terminal_chart,
@@ -182,6 +183,50 @@ def test_flat_chart_survives_screenshot_chain(engine: WatermarkEngine, tmp_path:
 def test_coarse_grid_contains_identity_scale() -> None:
     """Утёкшую картинку чаще всего пересылают как есть — масштаб ровно 100%."""
     assert 100 in coarse_percents()
+
+
+@pytest.mark.parametrize("scale", [0.8, 0.6, 0.5, 0.4])
+def test_flat_chart_survives_jpeg_plus_downscale(
+    engine: WatermarkEngine, tmp_path: Path, scale: float
+) -> None:
+    """Связка «сжатие + уменьшение» — то, что реально делает скриншот.
+
+    Именно она, а не сжатие само по себе, убивала метку на однотонном графике
+    при силе встраивания по умолчанию.
+    """
+    source = tmp_path / "terminal.png"
+    make_terminal_chart().save(source)
+    result = engine.embed(source, tmp_path / "marked.png", PAYLOAD)
+
+    with Image.open(result.path) as image:
+        attacked = jpeg(rescale(jpeg(image, 87), scale), 90)
+    assert engine.extract(to_bgr(attacked), result.size) == PAYLOAD
+
+
+def test_locate_finds_small_preview_on_desktop_screenshot(
+    engine: WatermarkEngine, tmp_path: Path
+) -> None:
+    """Мелкую превьюшку надо НАЙТИ, даже если метку из неё уже не достать.
+
+    Иначе система показывает ложное совпадение с чужим уроком вместо честного
+    «слишком мелко» — а это подрывает доверие к результату трассировки.
+    """
+    source = tmp_path / "terminal.png"
+    make_terminal_chart().save(source)
+    result = engine.embed(source, tmp_path / "marked.png", PAYLOAD)
+
+    offset = (360, 120)
+    with Image.open(result.path) as image:
+        shot = to_bgr(jpeg(desktop_screenshot(image, 0.2, offset=offset), 90))
+
+    match = locate(shot, source)
+    assert match is not None
+    # До расширения диапазона поиска здесь было ~0.09 — уровень чистого шума.
+    assert match.confidence > 0.6, f"превью не найдено: {match.confidence:.0%}"
+    assert match.box[:2] == offset
+    # Точность до пикселя тут недостижима: превью уменьшено LANCZOS, а шаблон
+    # при переборе — INTER_AREA, и оптимум корреляции сдвигается на пиксель.
+    assert abs(match.box[2] - int(result.size[0] * 0.2)) <= 3
 
 
 def test_locate_finds_forwarded_copy(engine: WatermarkEngine, tmp_path: Path) -> None:

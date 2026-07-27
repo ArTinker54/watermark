@@ -13,6 +13,7 @@ from aiogram.types import Message
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.services import Storage, TraceHit, TraceMiss, TraceResult, TraceService
 from app.utils import format_dt
+from app.watermark import READABLE_SCALE
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +62,27 @@ async def run_trace(
 
 def _format(result: TraceResult) -> str:
     if isinstance(result, TraceMiss):
-        lines = ["<b>Метку прочитать не удалось</b>", "", result.reason]
-        if result.best_confidence is not None:
-            lines.append("")
-            lines.append(
-                f"Лучшее совпадение: {result.best_confidence:.0%} "
-                f"(урок #{result.best_lesson_id})"
-            )
-        lines.append(f"Проверено оригиналов: {result.checked}")
-        return "\n".join(lines)
-
+        return _format_miss(result)
     return _format_hit(result)
+
+
+def _format_miss(miss: TraceMiss) -> str:
+    lines = ["<b>Метку прочитать не удалось</b>", "", miss.reason, ""]
+
+    if miss.scale is not None and miss.scale < READABLE_SCALE:
+        # Тут важно не просто отказать, а сказать, что сделать по-другому.
+        lines += [
+            "<b>Что поможет:</b>",
+            "• переслать сам файл или картинку из чата, а не снимок всего экрана;",
+            "• если это снимок экрана — открыть картинку на весь экран и снять её так;",
+            "• не уменьшать и не обрезать картинку перед отправкой.",
+            "",
+        ]
+
+    if miss.best_lesson_id is not None:
+        lines.append(f"Похоже на урок #{miss.best_lesson_id}")
+    lines.append(f"Проверено оригиналов: {miss.checked}")
+    return "\n".join(lines)
 
 
 def _format_hit(hit: TraceHit) -> str:

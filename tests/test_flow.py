@@ -24,8 +24,8 @@ from app.db.repo import (
 )
 from app.services import LessonBroadcaster, LessonSpec, Storage, TraceHit, TraceMiss, TraceService
 from app.services.lessons import save_lesson
-from app.watermark import Payload, WatermarkEngine
-from tests.conftest import PW_IMG, PW_WM, jpeg, make_chart, screenshot
+from app.watermark import READABLE_SCALE, Payload, WatermarkEngine
+from tests.conftest import PW_IMG, PW_WM, desktop_screenshot, jpeg, make_chart, screenshot
 
 
 @dataclass
@@ -220,6 +220,40 @@ async def test_full_flow_delivery_and_trace(
         stats = await collect_stats(session)
     assert (stats.students_active, stats.lessons, stats.deliveries_sent) == (2, 1, 2)
     assert stats.traces_success == 1
+
+
+async def test_tiny_preview_reports_size_not_false_match(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Скрин всего экрана: ответ обязан назвать причину — «слишком мелко»."""
+    student = await _register(database, 8001, "Алиса")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session, storage, admin_tg_id=1, caption=None, staged=[lesson_source]
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    with Image.open(bot.delivered_to(student.tg_user_id)[0]) as delivered:
+        shot = jpeg(desktop_screenshot(delivered, 0.18), 90)
+    leak = settings.storage_path / "desktop_leak.png"
+    shot.save(leak)
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(leak, admin_tg_id=1)
+
+    assert isinstance(result, TraceMiss)
+    assert result.best_lesson_id == lesson.id, "урок должен быть опознан, пусть метка и не читается"
+    assert result.scale is not None and result.scale < READABLE_SCALE
+    assert "занимает" in result.reason and "%" in result.reason
 
 
 async def test_unrelated_image_is_not_attributed(
