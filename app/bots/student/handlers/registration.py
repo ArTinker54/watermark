@@ -32,6 +32,9 @@ CONSENT_CALLBACK = "offer:accept"
 
 _ALLOWED_MEMBER_STATUSES = frozenset({"creator", "administrator", "member", "restricted"})
 
+#: Ошибки getChatMember, означающие «этого человека в группе нет», а не сбой.
+_NOT_A_MEMBER_ERRORS = ("PARTICIPANT_ID_INVALID", "USER_NOT_PARTICIPANT", "USER NOT FOUND")
+
 
 def _consent_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -51,10 +54,19 @@ def _welcome(uid_str: str) -> str:
 
 
 async def _is_group_member(bot: Bot, group_id: int, user_id: int) -> bool | None:
-    """``None`` — проверить не удалось (бот не в группе, неверный id и т. п.)."""
+    """``True`` — в группе, ``False`` — нет, ``None`` — проверить не удалось.
+
+    Различать второе и третье важно: «вас нет в группе» человек поймёт и пойдёт
+    вступать, а «не удалось проверить» отправит его писать администратору.
+    """
     try:
         member = await bot.get_chat_member(chat_id=group_id, user_id=user_id)
     except TelegramBadRequest as exc:
+        text = str(exc).upper()
+        if any(marker in text for marker in _NOT_A_MEMBER_ERRORS):
+            # Telegram отвечает ошибкой, а не статусом «вышел», когда человек
+            # к группе вообще не имеет отношения. Это ответ «нет», не поломка.
+            return False
         logger.error("проверка членства в группе %s не удалась: %s", group_id, exc)
         return None
     return member.status in _ALLOWED_MEMBER_STATUSES

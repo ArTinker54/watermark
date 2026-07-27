@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from aiogram import Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Chat
 
 from app.bots.student.handlers import common, registration
 from app.bots.student.handlers.chats import handle_group_id, on_membership_change
+from app.bots.student.handlers.registration import _is_group_member
 from app.config import Settings
 
 
@@ -127,6 +131,45 @@ async def test_groupid_ignores_linked_channel() -> None:
     message = _FakeGroupMessage(chat, user_id=1087968824, sender_chat=channel)
     await handle_group_id(message, _settings("987"))
     assert message.replies == []
+
+
+class _FakeMemberBot:
+    """Заглушка getChatMember: отдаёт статус или роняет ошибку Telegram."""
+
+    def __init__(self, *, status: str | None = None, error: str | None = None) -> None:
+        self._status = status
+        self._error = error
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> object:
+        if self._error is not None:
+            raise TelegramBadRequest(method=Mock(), message=self._error)
+        return SimpleNamespace(status=self._status)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("creator", True), ("administrator", True), ("member", True), ("restricted", True),
+     ("left", False), ("kicked", False)],
+)
+async def test_membership_by_status(status: str, expected: bool) -> None:
+    result = await _is_group_member(_FakeMemberBot(status=status), -100, 42)  # type: ignore[arg-type]
+    assert result is expected
+
+
+async def test_absent_user_is_not_a_failure() -> None:
+    """Telegram отвечает ошибкой, а не статусом «вышел», если человека в группе нет.
+
+    Это ответ «нет», и человеку надо сказать «вступите в группу», а не гнать его
+    к администратору с жалобой на поломку.
+    """
+    bot = _FakeMemberBot(error="Bad Request: PARTICIPANT_ID_INVALID")
+    assert await _is_group_member(bot, -100, 42) is False  # type: ignore[arg-type]
+
+
+async def test_real_failure_stays_unknown() -> None:
+    """Настоящий сбой не должен маскироваться под «вас нет в группе»."""
+    bot = _FakeMemberBot(error="Bad Request: chat not found")
+    assert await _is_group_member(bot, -100, 42) is None  # type: ignore[arg-type]
 
 
 async def test_private_chat_is_ignored(caplog: pytest.LogCaptureFixture) -> None:
