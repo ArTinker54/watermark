@@ -46,6 +46,13 @@ class AdminOnlyMiddleware(BaseMiddleware):
         user: User | None = data.get("event_from_user")
         if user is None or user.id not in self._admin_ids:
             if user is not None:
-                logger.warning("отказано в доступе к admin-боту: user_id=%s", user.id)
+                # Имя пишем рядом с id намеренно: когда автор просит выдать
+                # доступ коллеге, по одному числу не понять, тот ли это человек.
+                logger.warning(
+                    "отказано в доступе к admin-боту: user_id=%s @%s %s",
+                    user.id,
+                    user.username or "-",
+                    user.full_name,
+                )
             return None
         return await handler(event, data)
