@@ -47,6 +47,7 @@ async def save_lesson(
     caption: str | None,
     staged: Sequence[Path],
     max_side: int,
+    question_id: int | None = None,
 ) -> Lesson:
     """Превратить черновик в урок.
 
@@ -70,6 +71,7 @@ async def save_lesson(
         admin_tg_id=admin_tg_id,
         caption=caption,
         materialize=materialize,
+        question_id=question_id,
     )
     sizes = ", ".join(f"{image.width}x{image.height}" for image in lesson.images)
     logger.info(

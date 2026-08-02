@@ -54,6 +54,12 @@ class DeliveryStatus(enum.StrEnum):
     FAILED = "failed"
 
 
+class QuestionStatus(enum.StrEnum):
+    NEW = "new"
+    ANSWERED = "answered"
+    SKIPPED = "skipped"
+
+
 class Student(Base):
     """Участник курса. Регистрируется только сам, через /start в student-bot."""
 
@@ -94,8 +100,44 @@ class Student(Base):
         return self.consent_at is not None
 
 
+class Question(Base):
+    """Вопрос ученика. Ответ на него выдаётся такой же меченой копией.
+
+    Разбор по запросу — самый ценный контент, и раньше он уходил в общий чат
+    без метки. Теперь ответ идёт через бота и метится наравне с уроком.
+    """
+
+    __tablename__ = "questions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), index=True
+    )
+    text: Mapped[str | None] = mapped_column(Text, default=None)
+    image_path: Mapped[str | None] = mapped_column(String(512), default=None)
+    """Скриншот, приложенный учеником к вопросу."""
+
+    status: Mapped[QuestionStatus] = mapped_column(
+        _enum_column(QuestionStatus), default=QuestionStatus.NEW, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+
+    student: Mapped[Student] = relationship(lazy="selectin")
+
+    @property
+    def preview(self) -> str:
+        if self.text:
+            return self.text if len(self.text) <= 300 else self.text[:297] + "…"
+        return "(без текста, только картинка)"
+
+
 class Lesson(Base):
-    """Урок: текст поста и пристинные оригиналы картинок (без метки!)."""
+    """Материал: текст поста и пристинные оригиналы картинок (без метки!).
+
+    Ответ на вопрос — тот же материал, просто со ссылкой на вопрос. Механика
+    метки, рассылки и трассировки для них общая.
+    """
 
     __tablename__ = "lessons"
 
@@ -105,7 +147,22 @@ class Lesson(Base):
     original_image_path: Mapped[str] = mapped_column(String(512))
     """Главная (первая) картинка урока. Полный список — в ``images``."""
 
+    question_id: Mapped[int | None] = mapped_column(
+        ForeignKey("questions.id", ondelete="SET NULL"), default=None, index=True
+    )
+    """Заполнено, если материал — ответ на вопрос ученика."""
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    question: Mapped[Question | None] = relationship(lazy="selectin")
+
+    @property
+    def is_answer(self) -> bool:
+        return self.question_id is not None
+
+    @property
+    def title(self) -> str:
+        return f"Ответ на вопрос №{self.question_id}" if self.is_answer else f"Урок #{self.id}"
 
     images: Mapped[list[LessonImage]] = relationship(
         back_populates="lesson",

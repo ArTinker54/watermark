@@ -15,12 +15,17 @@ import pytest
 from PIL import Image
 
 from app.config import Settings
-from app.db import Student, create_database
+from app.db import QuestionStatus, Student, create_database
 from app.db.repo import (
+    MAX_OPEN_QUESTIONS,
     collect_stats,
+    count_open_questions,
+    create_question,
     get_delivery,
     list_active_students,
+    list_open_questions,
     register_student,
+    set_question_status,
 )
 from app.services import LessonBroadcaster, LessonSpec, Storage, TraceHit, TraceMiss, TraceService
 from app.services.lessons import save_lesson
@@ -461,6 +466,109 @@ async def test_cropped_leak_is_still_traced(
     assert isinstance(result, TraceHit), getattr(result, "reason", result)
     assert result.payload == Payload(uid=student.uid, lesson_id=lesson.id)
     assert result.student is not None and result.student.tg_user_id == student.tg_user_id
+
+
+async def test_personal_answer_is_marked_and_reaches_only_the_asker(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Разбор по запросу — самый ценный материал, и метиться он обязан.
+
+    Раньше такой ответ уходил картинкой в общий чат, без метки: утёк — и concу.
+    """
+    asker = await _register(database, 9600, "Никита")
+    other = await _register(database, 9601, "Алиса")
+
+    async with database.session_factory() as session:
+        question = await create_question(
+            session, student_id=asker.id, text="По газу пробой или ложный?", image_path=None
+        )
+        answer = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption="Смотри на объём в момент пробоя",
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+            question_id=question.id,
+        )
+        await set_question_status(session, question, QuestionStatus.ANSWERED)
+        recipients = [
+            s for s in await list_active_students(session) if s.tg_user_id == asker.tg_user_id
+        ]
+
+    assert answer.is_answer and answer.title == f"Ответ на вопрос №{question.id}"
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_answer")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(answer), recipients
+    )
+    assert report.sent == 1
+    assert bot.delivered_to(other.tg_user_id) == [], "лично — значит только спросившему"
+
+    # Ответ утёк: по картинке должно опознаваться и кто, и что именно.
+    with Image.open(bot.delivered_to(asker.tg_user_id)[0]) as delivered:
+        leak = settings.storage_path / "answer_leak.png"
+        jpeg(delivered, 88).save(leak)
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(leak, admin_tg_id=1)
+
+    assert isinstance(result, TraceHit), getattr(result, "reason", result)
+    assert result.student is not None and result.student.tg_user_id == asker.tg_user_id
+    assert result.lesson.question_id == question.id
+
+
+async def test_question_limit_protects_from_flood(database) -> None:
+    """Иначе один ученик засыпет автора и вопросы остальных потеряются."""
+    student = await _register(database, 9700, "Никита")
+
+    async with database.session_factory() as session:
+        for i in range(MAX_OPEN_QUESTIONS):
+            await create_question(
+                session, student_id=student.id, text=f"вопрос {i}", image_path=None
+            )
+        assert await count_open_questions(session, student.id) == MAX_OPEN_QUESTIONS
+
+    # Ответ на один освобождает место — счётчик считает только неотвеченные.
+    async with database.session_factory() as session:
+        questions = await list_open_questions(session)
+        await set_question_status(session, questions[0], QuestionStatus.ANSWERED)
+        assert await count_open_questions(session, student.id) == MAX_OPEN_QUESTIONS - 1
+
+
+async def test_answers_and_lessons_counted_apart(
+    database, storage: Storage, settings: Settings, lesson_source: Path
+) -> None:
+    student = await _register(database, 9800, "Никита")
+    async with database.session_factory() as session:
+        await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        question = await create_question(
+            session, student_id=student.id, text="вопрос", image_path=None
+        )
+        await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+            question_id=question.id,
+        )
+        stats = await collect_stats(session)
+
+    assert (stats.lessons, stats.answers) == (1, 1)
+    assert stats.questions_open == 1
 
 
 async def test_unrelated_image_is_not_attributed(

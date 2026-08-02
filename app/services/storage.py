@@ -89,3 +89,16 @@ class Storage:
     def trace_input(self) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return self.traces_root / f"{stamp}_{uuid4().hex[:8]}.png"
+
+    # --- Вопросы ---
+
+    @property
+    def questions_root(self) -> Path:
+        directory = self.root / "questions"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def question_image(self) -> Path:
+        """Скриншот, приложенный учеником к вопросу. Метки на нём нет."""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return self.questions_root / f"{stamp}_{uuid4().hex[:8]}.png"

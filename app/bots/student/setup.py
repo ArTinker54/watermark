@@ -11,6 +11,7 @@ from app.bots.runtime import BotRuntime, make_bot
 from app.bots.student.handlers import build_router
 from app.config import Settings
 from app.db import Database
+from app.services import Storage
 
 COMMANDS = [
     BotCommand(command="start", description="Регистрация и условия"),
@@ -21,15 +22,26 @@ COMMANDS = [
 
 
 def build_student(
-    settings: Settings, database: Database, *, bot: Bot | None = None
+    settings: Settings,
+    database: Database,
+    *,
+    bot: Bot | None = None,
+    admin_notifier: Bot,
 ) -> BotRuntime:
     """``bot`` передают, когда объект уже создан для рассылки, — чтобы не
-    держать два подключения к одному и тому же боту."""
+    держать два подключения к одному и тому же боту.
+
+    ``admin_notifier`` — подключение admin-бота: им уходят уведомления о новых
+    вопросах. Своим токеном student-бот автору написать не может, если тот не
+    нажимал у него Start.
+    """
     owns_session = bot is None
     bot = bot or make_bot(settings.student_bot_token)
 
     dispatcher = Dispatcher()
     dispatcher["settings"] = settings
+    dispatcher["storage"] = Storage(root=settings.storage_path)
+    dispatcher["admin_notifier"] = admin_notifier
     dispatcher.update.outer_middleware(DbSessionMiddleware(database.session_factory))
     dispatcher.include_router(build_router())
 

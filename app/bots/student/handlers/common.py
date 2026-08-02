@@ -20,11 +20,12 @@ _NOT_REGISTERED = "Вы ещё не приняли условия. Нажмит�
 
 _HELP = (
     "<b>Что умеет этот бот</b>\n\n"
-    "/start — регистрация и повторный показ условий\n"
+    "Уроки приходят сюда автоматически — запрашивать их не нужно.\n\n"
+    "<b>Хотите разбор по своей ситуации?</b> Просто напишите вопрос сюда, "
+    "можно приложить скриншот графика. Автор курса ответит в этом же чате.\n\n"
     "/id — ваш персональный номер участника\n"
     "/offer — условия доступа\n"
-    "/help — эта справка\n\n"
-    "Уроки приходят автоматически, запрашивать их не нужно."
+    "/help — эта справка"
 )
 
 
@@ -54,15 +55,5 @@ async def handle_offer(message: Message, settings: Settings) -> None:
         await message.answer(chunk)
 
 
-@router.message(F.text)
-async def handle_anything_else(message: Message, session: AsyncSession) -> None:
-    """Ученику ничего не нужно писать — подсказываем, а не молчим."""
-    if message.from_user is None:
-        return
-    student = await get_student_by_tg_id(session, message.from_user.id)
-    if student is None or not student.has_consent:
-        await message.answer(_NOT_REGISTERED)
-        return
-    await message.answer(
-        "Уроки приходят сюда автоматически. Справка — /help."
-    )
+# Ловушки на произвольный текст здесь больше нет: такие сообщения принимает
+# questions.py и превращает их в вопрос автору.

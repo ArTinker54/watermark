@@ -36,12 +36,14 @@ async def main() -> None:
     database = create_database(settings)
     await database.create_all()
 
-    # Один объект Bot на токен student-бота: он же принимает /start учеников,
-    # он же рассылает уроки. Второе подключение к тому же боту ни к чему.
+    # По одному объекту Bot на токен: student-бот и принимает /start, и
+    # рассылает уроки; admin-бот и общается с автором, и шлёт ему уведомления
+    # о вопросах. Вторые подключения к тем же ботам ни к чему.
     student_bot = make_bot(settings.student_bot_token)
+    admin_bot = make_bot(settings.admin_bot_token)
     runtimes = [
-        build_student(settings, database, bot=student_bot),
-        build_admin(settings, database, student_bot=student_bot),
+        build_student(settings, database, bot=student_bot, admin_notifier=admin_bot),
+        build_admin(settings, database, student_bot=student_bot, bot=admin_bot),
     ]
     try:
         await run_bots(runtimes, database)

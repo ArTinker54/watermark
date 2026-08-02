@@ -90,7 +90,7 @@ def _format_hit(hit: TraceHit) -> str:
     lines = [
         "<b>Метка найдена</b>",
         "",
-        f"Урок: <b>#{hit.lesson.id}</b> от {format_dt(hit.lesson.created_at)}",
+        f"Материал: <b>{hit.lesson.title}</b> от {format_dt(hit.lesson.created_at)}",
     ]
 
     if hit.student is not None:

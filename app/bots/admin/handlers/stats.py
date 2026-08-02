@@ -16,11 +16,12 @@ router = Router(name="stats")
 _HELP = (
     "<b>Панель автора</b>\n\n"
     "/newlesson — собрать урок и разослать персональные копии\n"
+    "/questions — вопросы учеников без ответа\n"
     "/trace — определить, кто слил присланную картинку\n"
     "/stats — цифры по базе\n"
     "/cancel — прервать текущий сценарий\n\n"
-    "Картинку или скриншот можно прислать и просто так — "
-    "бот сразу начнёт трассировку."
+    "Вопросы приходят сюда сами, как только ученик их задаст.\n"
+    "Картинку или скриншот можно прислать просто так — бот начнёт трассировку."
 )
 
 
@@ -42,6 +43,9 @@ async def handle_stats(message: Message, session: AsyncSession) -> None:
         f"Учеников: {stats.students_total} "
         f"(получают материалы: {stats.students_active})\n"
         f"Уроков: {stats.lessons}\n"
+        f"Ответов на вопросы: {stats.answers}"
+        + (f" (без ответа: {stats.questions_open})" if stats.questions_open else "")
+        + "\n"
         f"Доставок: {stats.deliveries_sent} успешных"
         + (f", {stats.deliveries_failed} с ошибкой" if stats.deliveries_failed else "")
         + "\n"

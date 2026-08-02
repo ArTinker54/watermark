@@ -20,6 +20,8 @@ from app.db.models import (
     DeliveryStatus,
     Lesson,
     LessonImage,
+    Question,
+    QuestionStatus,
     Student,
     StudentStatus,
     TraceAttempt,
@@ -143,6 +145,7 @@ async def create_lesson(
     admin_tg_id: int,
     caption: str | None,
     materialize: Callable[[int], Sequence[ImageSpec]],
+    question_id: int | None = None,
 ) -> Lesson:
     """Создать урок. Коммитит сама.
 
@@ -154,7 +157,13 @@ async def create_lesson(
     # images=[] инициализирует коллекцию сразу: после flush объект становится
     # persistent, и присваивание в незагруженную связь дёрнуло бы ленивый SELECT
     # вне greenlet-контекста — в async это падение, а не подзагрузка.
-    lesson = Lesson(admin_tg_id=admin_tg_id, caption=caption, original_image_path="", images=[])
+    lesson = Lesson(
+        admin_tg_id=admin_tg_id,
+        caption=caption,
+        original_image_path="",
+        question_id=question_id,
+        images=[],
+    )
     session.add(lesson)
     await session.flush()
 
@@ -246,6 +255,68 @@ async def get_delivery(
     return result.scalar_one_or_none()
 
 
+# --- Вопросы -------------------------------------------------------------------
+
+#: Сколько неотвеченных вопросов можно накопить одному ученику.
+MAX_OPEN_QUESTIONS = 5
+
+
+async def count_open_questions(session: AsyncSession, student_id: int) -> int:
+    result = await session.execute(
+        select(func.count())
+        .select_from(Question)
+        .where(Question.student_id == student_id, Question.status == QuestionStatus.NEW)
+    )
+    return int(result.scalar_one() or 0)
+
+
+async def create_question(
+    session: AsyncSession,
+    *,
+    student_id: int,
+    text: str | None,
+    image_path: Path | None,
+) -> Question:
+    """Записать вопрос. Коммитит сама."""
+    question = Question(
+        student_id=student_id,
+        text=text,
+        image_path=str(image_path) if image_path else None,
+    )
+    session.add(question)
+    await session.commit()
+    await session.refresh(question, attribute_names=["student"])
+    return question
+
+
+async def get_question(session: AsyncSession, question_id: int) -> Question | None:
+    result = await session.execute(
+        select(Question).where(Question.id == question_id).options(selectinload(Question.student))
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_open_questions(session: AsyncSession, *, limit: int = 20) -> Sequence[Question]:
+    result = await session.execute(
+        select(Question)
+        .where(Question.status == QuestionStatus.NEW)
+        .options(selectinload(Question.student))
+        .order_by(Question.id)
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def set_question_status(
+    session: AsyncSession, question: Question, status: QuestionStatus
+) -> None:
+    """Отметить вопрос отвеченным или отложенным. Коммитит сама."""
+    question.status = status
+    if status is QuestionStatus.ANSWERED:
+        question.answered_at = utcnow()
+    await session.commit()
+
+
 # --- Журнал трассировок --------------------------------------------------------
 
 
@@ -285,8 +356,10 @@ class Stats:
     students_total: int
     students_active: int
     lessons: int
+    answers: int
     deliveries_sent: int
     deliveries_failed: int
+    questions_open: int
     traces_total: int
     traces_success: int
     last_lesson_at: datetime | None
@@ -303,7 +376,15 @@ async def collect_stats(session: AsyncSession) -> Stats:
         .select_from(Student)
         .where(Student.status == StudentStatus.ACTIVE, Student.consent_at.is_not(None))
     )
-    lessons = await scalar(select(func.count()).select_from(Lesson))
+    lessons = await scalar(
+        select(func.count()).select_from(Lesson).where(Lesson.question_id.is_(None))
+    )
+    answers = await scalar(
+        select(func.count()).select_from(Lesson).where(Lesson.question_id.is_not(None))
+    )
+    questions_open = await scalar(
+        select(func.count()).select_from(Question).where(Question.status == QuestionStatus.NEW)
+    )
     sent = await scalar(
         select(func.count()).select_from(Delivery).where(Delivery.status == DeliveryStatus.SENT)
     )
@@ -320,8 +401,10 @@ async def collect_stats(session: AsyncSession) -> Stats:
         students_total=students_total,
         students_active=students_active,
         lessons=lessons,
+        answers=answers,
         deliveries_sent=sent,
         deliveries_failed=failed,
+        questions_open=questions_open,
         traces_total=traces_total,
         traces_success=traces_success,
         last_lesson_at=last_lesson.scalar_one(),

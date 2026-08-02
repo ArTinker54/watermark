@@ -21,13 +21,16 @@ from app.watermark import WatermarkEngine
 
 COMMANDS = [
     BotCommand(command="newlesson", description="Новый урок и рассылка"),
+    BotCommand(command="questions", description="Вопросы без ответа"),
     BotCommand(command="trace", description="Найти источник утечки"),
     BotCommand(command="stats", description="Статистика"),
     BotCommand(command="cancel", description="Прервать сценарий"),
 ]
 
 
-def build_admin(settings: Settings, database: Database, *, student_bot: Bot) -> BotRuntime:
+def build_admin(
+    settings: Settings, database: Database, *, student_bot: Bot, bot: Bot | None = None
+) -> BotRuntime:
     storage = Storage(root=settings.storage_path)
     engine = WatermarkEngine(
         password_img=settings.wm_pw_img,
@@ -59,7 +62,7 @@ def build_admin(settings: Settings, database: Database, *, student_bot: Bot) -> 
     return BotRuntime(
         name="admin-bot",
         token_env="ADMIN_BOT_TOKEN",
-        bot=make_bot(settings.admin_bot_token),
+        bot=bot or make_bot(settings.admin_bot_token),
         dispatcher=dispatcher,
         commands=COMMANDS,
     )

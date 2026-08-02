@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.bots.runtime import run_bots
+from app.bots.runtime import make_bot, run_bots
 from app.bots.student.setup import build_student
 from app.config import get_settings
 from app.db import create_database
@@ -18,7 +18,14 @@ async def main() -> None:
     database = create_database(settings)
     await database.create_all()
 
-    await run_bots([build_student(settings, database)], database)
+    # Подключение admin-бота нужно только на отправку: им уходят уведомления
+    # о новых вопросах. Опрашивает его отдельный процесс.
+    notifier = make_bot(settings.admin_bot_token)
+    runtime = build_student(settings, database, admin_notifier=notifier)
+    try:
+        await run_bots([runtime], database)
+    finally:
+        await notifier.session.close()
 
 
 if __name__ == "__main__":

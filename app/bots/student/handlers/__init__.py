@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from aiogram import Router
 
-from app.bots.student.handlers import chats, common, registration
+from app.bots.student.handlers import chats, common, questions, registration
 
 
 def build_router() -> Router:
-    """Порядок важен: ловушка на любой текст в ``common`` идёт последней."""
+    """Порядок важен: ``questions`` ловит любое сообщение и идёт последним."""
     router = Router(name="student")
     router.include_router(chats.router)
     router.include_router(registration.router)
     router.include_router(common.router)
+    router.include_router(questions.router)
     return router
 
 
