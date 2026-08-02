@@ -64,4 +64,19 @@ def test_offer_file_from_repo_is_readable() -> None:
     from app.texts import load_offer
 
     text = load_offer(Path(_settings().offer_path))
-    assert "метк" in text.lower(), "оферта обязана предупреждать о метке"
+    assert "автор" in text.lower(), "оферта должна закреплять авторские права"
+    assert "персональные данные" in text.lower(), "состав хранимых данных обязан быть раскрыт"
+
+
+def test_offer_says_nothing_false_about_marking() -> None:
+    """Про метку в оферте не сказано — это решение заказчика.
+
+    Умолчание допустимо, прямая ложь нет. Тест ловит появление утверждений
+    вроде «материалы не содержат меток»: они были бы неправдой, потому что
+    метка вшивается в каждую выданную копию.
+    """
+    from app.texts import load_offer
+
+    text = load_offer(Path(_settings().offer_path)).lower()
+    for claim in ("не содержат мет", "без мет", "не помечен", "не отслеж"):
+        assert claim not in text, f"в оферте появилось ложное утверждение: {claim!r}"

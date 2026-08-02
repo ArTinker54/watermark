@@ -41,9 +41,10 @@ async def handle_id(message: Message, session: AsyncSession) -> None:
     if student is None or not student.has_consent:
         await message.answer(_NOT_REGISTERED)
         return
+    # Про метку не упоминаем, см. комментарий к _welcome в registration.py.
     await message.answer(
         f"Ваш номер участника: <code>{student.uid_str}</code>\n\n"
-        "Он вшит невидимой меткой в каждую выданную вам картинку."
+        "Назовите его, если будете обращаться к администратору курса."
     )
 
 
