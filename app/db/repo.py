@@ -8,8 +8,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -252,6 +253,66 @@ async def record_delivery(
         statement = statement.on_conflict_do_nothing(index_elements=index)
     await session.execute(statement)
     await session.commit()
+
+
+@dataclass(frozen=True, slots=True)
+class LessonSummary:
+    """Материал и что с ним стало при рассылке."""
+
+    lesson: Lesson
+    sent: int
+    skipped: int
+    failed: int
+
+    @property
+    def recipients(self) -> int:
+        return self.sent
+
+
+def _count_status(status: DeliveryStatus) -> Any:
+    return func.sum(case((Delivery.status == status, 1), else_=0))
+
+
+async def list_lesson_summaries(
+    session: AsyncSession, *, limit: int = 10
+) -> Sequence[LessonSummary]:
+    """Последние материалы со счётчиками доставок — одним запросом.
+
+    LEFT JOIN, а не INNER: материал без единой доставки тоже надо показать,
+    иначе несостоявшаяся рассылка просто исчезнет из сводки.
+    """
+    query = (
+        select(
+            Lesson,
+            _count_status(DeliveryStatus.SENT).label("sent"),
+            _count_status(DeliveryStatus.SKIPPED).label("skipped"),
+            _count_status(DeliveryStatus.FAILED).label("failed"),
+        )
+        .outerjoin(Delivery, Delivery.lesson_id == Lesson.id)
+        .options(selectinload(Lesson.images), selectinload(Lesson.question))
+        .group_by(Lesson.id)
+        .order_by(Lesson.id.desc())
+        .limit(limit)
+    )
+    result = await session.execute(query)
+    return [
+        LessonSummary(lesson=row[0], sent=int(row[1] or 0), skipped=int(row[2] or 0),
+                      failed=int(row[3] or 0))
+        for row in result.all()
+    ]
+
+
+async def list_lesson_deliveries(
+    session: AsyncSession, lesson_id: int
+) -> Sequence[tuple[Delivery, Student]]:
+    """Кому и с каким исходом выдавался материал."""
+    result = await session.execute(
+        select(Delivery, Student)
+        .join(Student, Student.id == Delivery.student_id)
+        .where(Delivery.lesson_id == lesson_id)
+        .order_by(Student.uid)
+    )
+    return [(row[0], row[1]) for row in result.all()]
 
 
 async def get_delivery(

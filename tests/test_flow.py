@@ -33,6 +33,7 @@ from app.db.repo import (
     create_question,
     get_delivery,
     list_active_students,
+    list_lesson_summaries,
     list_open_questions,
     record_delivery,
     register_student,
@@ -949,6 +950,108 @@ def test_report_warns_when_nobody_passed_the_check() -> None:
         DeliveryOutcome(uid=3, name="У3", ok=False, error="нет в группе курса", skipped=True),
     ]
     assert "Ни один ученик" not in format_report("Урок #9 разослан", partial)
+
+
+async def test_lesson_summary_counts_by_status(
+    database, storage: Storage, settings: Settings, lesson_source: Path
+) -> None:
+    """Сводка по материалу должна разделять получивших, пропущенных и сбои."""
+    got = await _register(database, 9910, "Получил")
+    left = await _register(database, 9911, "Ушёл")
+    broke = await _register(database, 9912, "Сбой")
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        for student, status in (
+            (got, DeliveryStatus.SENT),
+            (left, DeliveryStatus.SKIPPED),
+            (broke, DeliveryStatus.FAILED),
+        ):
+            await record_delivery(
+                session,
+                lesson_id=lesson.id,
+                student_id=student.id,
+                wm_payload="" if status is DeliveryStatus.SKIPPED else "V|0001|00001",
+                status=status,
+            )
+        summaries = await list_lesson_summaries(session)
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert (summary.sent, summary.skipped, summary.failed) == (1, 1, 1)
+    assert summary.recipients == 1, "получателями считаются только реально получившие"
+
+
+async def test_lesson_without_deliveries_still_listed(
+    database, storage: Storage, settings: Settings, lesson_source: Path
+) -> None:
+    """Несостоявшаяся рассылка не должна исчезать из сводки."""
+    async with database.session_factory() as session:
+        await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        summaries = await list_lesson_summaries(session)
+
+    assert len(summaries) == 1
+    assert (summaries[0].sent, summaries[0].skipped, summaries[0].failed) == (0, 0, 0)
+
+
+async def test_split_by_membership_reports_live_numbers(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Число получателей берётся живой проверкой, а не из базы."""
+    inside = await _register(database, 9913, "В группе")
+    outside = await _register(database, 9914, "Вне группы")
+    async with database.session_factory() as session:
+        students = list(await list_active_students(session))
+
+    bot = _MembershipBot(
+        outbox=settings.storage_path / "outbox_split", members={inside.tg_user_id}
+    )
+    kept, dropped = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-100500
+    ).split_by_membership(students)
+
+    assert [s.uid for s in kept] == [inside.uid]
+    assert [s.uid for s in dropped] == [outside.uid]
+
+    # Ничего не записали: это только просмотр.
+    async with database.session_factory() as session:
+        assert await list_lesson_summaries(session) == []
+
+
+async def test_split_keeps_student_when_check_breaks(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Сбой проверки не должен вычёркивать ученика из числа получателей."""
+    student = await _register(database, 9915, "Алиса")
+    async with database.session_factory() as session:
+        students = list(await list_active_students(session))
+
+    bot = _MembershipBot(
+        outbox=settings.storage_path / "outbox_split_broken",
+        members=set(),
+        fail_for={student.tg_user_id},
+        failure=TelegramNetworkError(method=Mock(), message="Request timeout"),
+    )
+    kept, dropped = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-100500
+    ).split_by_membership(students)
+
+    assert [s.uid for s in kept] == [student.uid]
+    assert dropped == []
 
 
 async def test_unrelated_image_is_not_attributed(

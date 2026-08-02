@@ -200,41 +200,57 @@ class LessonBroadcaster:
         if self._group_id is None:
             return list(students)
 
+        kept, dropped = await self.split_by_membership(students)
+        for student in dropped:
+            # Запись пропуска в базу тоже может не удаться (SQLITE_BUSY, диск).
+            # Это не повод лишать урока остальных: сам факт пропуска уже
+            # известен и попадёт в отчёт.
+            try:
+                outcome = await self._skip(lesson, student)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("не записан пропуск uid=%s", student.uid_str)
+                outcome = DeliveryOutcome(
+                    uid=student.uid,
+                    name=student.display_name,
+                    ok=False,
+                    error=f"нет в группе курса; запись в журнал не удалась: {exc}",
+                    skipped=True,
+                )
+            report.outcomes.append(outcome)
+        return kept
+
+    async def split_by_membership(
+        self, students: Sequence[Student]
+    ) -> tuple[list[Student], list[Student]]:
+        """Разделить на тех, кто в группе, и тех, кого там уже нет.
+
+        Ничего не пишет в базу — годится и для рассылки, и для того, чтобы
+        просто посмотреть текущее число получателей.
+        """
+        if self._group_id is None:
+            return list(students), []
+
         verdicts = await asyncio.gather(
             *(self._entitled(student) for student in students), return_exceptions=True
         )
 
         kept: list[Student] = []
+        dropped: list[Student] = []
         for student, verdict in zip(students, verdicts, strict=True):
             if isinstance(verdict, BaseException):
                 # Сюда попадаем, только если сбой пережил повторы в _call.
                 logger.error(
-                    "членство uid=%s не проверено (%s) — выдаём материал, "
+                    "членство uid=%s не проверено (%s) — считаем получателем, "
                     "чтобы не наказать ученика за сбой",
                     student.uid_str,
                     verdict,
                 )
                 kept.append(student)
-                continue
-            if verdict:
+            elif verdict:
                 kept.append(student)
             else:
-                # Запись пропуска в базу тоже может не удаться (SQLITE_BUSY,
-                # диск). Это не повод лишать урока остальных: сам факт пропуска
-                # уже известен и попадёт в отчёт.
-                try:
-                    outcome = await self._skip(lesson, student)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("не записан пропуск uid=%s", student.uid_str)
-                    outcome = DeliveryOutcome(
-                        uid=student.uid,
-                        name=student.display_name,
-                        ok=False,
-                        error=f"нет в группе курса; запись в журнал не удалась: {exc}",
-                        skipped=True,
-                    )
-                report.outcomes.append(outcome)
-        return kept
+                dropped.append(student)
+        return kept, dropped
 
     async def _entitled(self, student: Student) -> bool:
         """Один запрос о членстве — через ту же очередь и повторы, что и отправки."""
