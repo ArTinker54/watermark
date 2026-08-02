@@ -9,13 +9,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from PIL import Image
 
+from app.bots.admin.handlers.report import format_report
 from app.config import Settings
-from app.db import QuestionStatus, Student, create_database
+from app.db import DeliveryStatus, QuestionStatus, Student, create_database
 from app.db.repo import (
     MAX_OPEN_QUESTIONS,
     collect_stats,
@@ -24,12 +34,22 @@ from app.db.repo import (
     get_delivery,
     list_active_students,
     list_open_questions,
+    record_delivery,
     register_student,
     set_question_status,
 )
-from app.services import LessonBroadcaster, LessonSpec, Storage, TraceHit, TraceMiss, TraceService
+from app.services import (
+    BroadcastReport,
+    DeliveryOutcome,
+    LessonBroadcaster,
+    LessonSpec,
+    Storage,
+    TraceHit,
+    TraceMiss,
+    TraceService,
+)
 from app.services.lessons import save_lesson
-from app.watermark import READABLE_SCALE, Payload, WatermarkEngine
+from app.watermark import READABLE_SCALE, Payload, WatermarkEngine, embed_async
 from tests.conftest import (
     PW_IMG,
     PW_WM,
@@ -569,6 +589,366 @@ async def test_answers_and_lessons_counted_apart(
 
     assert (stats.lessons, stats.answers) == (1, 1)
     assert stats.questions_open == 1
+
+
+class _MembershipBot(FakeBot):
+    """Заглушка Telegram, умеющая отвечать про членство в группе."""
+
+    def __init__(
+        self,
+        outbox: Path,
+        *,
+        members: set[int],
+        fail_for: set[int] | None = None,
+        failure: Exception | None = None,
+    ) -> None:
+        super().__init__(outbox=outbox)
+        self.members = members
+        self.fail_for = fail_for or set()
+        self.failure = failure
+        self.checked: list[int] = []
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> Any:
+        self.checked.append(user_id)
+        if user_id in self.fail_for and self.failure is not None:
+            raise self.failure
+        if user_id not in self.members:
+            raise TelegramBadRequest(method=Mock(), message="Bad Request: PARTICIPANT_ID_INVALID")
+        return SimpleNamespace(status="member")
+
+
+def _gated_broadcaster(bot: FakeBot, engine, storage, database, settings, group_id: int):
+    return LessonBroadcaster(
+        bot=bot,  # type: ignore[arg-type]
+        engine=engine,
+        storage=storage,
+        session_factory=database.session_factory,
+        rate_interval=settings.send_interval,
+        workers=settings.wm_workers,
+        group_id=group_id,
+    )
+
+
+async def test_left_the_group_stops_receiving(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Тот, кто вышел из группы или кого исключили, материалы получать перестаёт.
+
+    Проверка на регистрации закрывает только вход: без этой сверки выбывший
+    продолжал бы получать уроки бесконечно.
+    """
+    stays = await _register(database, 9900, "Остался")
+    left = await _register(database, 9901, "Ушёл")
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = _MembershipBot(
+        outbox=settings.storage_path / "outbox_gate", members={stays.tg_user_id}
+    )
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-100500
+    ).run(LessonSpec.of(lesson), students)
+
+    assert report.sent == 1
+    assert bot.delivered_to(left.tg_user_id) == []
+    assert bot.delivered_to(stays.tg_user_id) != []
+
+    # Пропуск — не сбой: автору это показывается отдельно.
+    assert [item.uid for item in report.skipped] == [left.uid]
+    assert report.failed == []
+
+    async with database.session_factory() as session:
+        record = await get_delivery(session, lesson_id=lesson.id, student_id=left.id)
+    assert record is not None and record.status is DeliveryStatus.SKIPPED
+    # Метки не создавали — записывать её в журнал нельзя, иначе трассировка
+    # решит, что материал ученику выдавали.
+    assert record.wm_payload == ""
+
+
+async def test_skipped_record_is_not_proof_of_delivery(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Пропуск не должен подтверждать выдачу при трассировке.
+
+    Если бы утёкшая копия нашлась, а в журнале лежала запись о ПРОПУСКЕ, бот
+    написал бы «доставка подтверждена журналом» — то есть утверждал бы выдачу,
+    которой не было. В разборе утечки такое недопустимо.
+    """
+    left = await _register(database, 9905, "Ушёл")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = _MembershipBot(outbox=settings.storage_path / "outbox_proof", members=set())
+    await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-100500
+    ).run(LessonSpec.of(lesson), students)
+
+    # Копию для этого ученика метим отдельно, будто она всё же где-то всплыла.
+    marked = storage.marked(lesson.id, left.uid, 0)
+    await embed_async(
+        engine, Path(lesson.original_image_path), marked, Payload(uid=left.uid, lesson_id=lesson.id)
+    )
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(marked, admin_tg_id=1)
+
+    assert isinstance(result, TraceHit)
+    assert result.student is not None and result.student.uid == left.uid
+    assert not result.delivery_confirmed, "запись о пропуске выдана за доказательство доставки"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TelegramRetryAfter(method=Mock(), message="Too Many Requests", retry_after=1),
+        TelegramForbiddenError(method=Mock(), message="Forbidden: bot was kicked"),
+        TelegramNetworkError(method=Mock(), message="Request timeout"),
+        TelegramServerError(method=Mock(), message="Bad Gateway"),
+        TelegramBadRequest(method=Mock(), message="Bad Request: chat not found"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+async def test_check_failure_never_breaks_the_broadcast(
+    database,
+    storage: Storage,
+    engine: WatermarkEngine,
+    settings: Settings,
+    lesson_source: Path,
+    failure: Exception,
+) -> None:
+    """Сбой проверки у ОДНОГО ученика не должен ни ронять рассылку, ни лишать его урока.
+
+    Все эти исключения — сёстры TelegramBadRequest по TelegramAPIError, а не
+    потомки. Узкий перехват ловил лишь последнее из них, остальные пролетали
+    насквозь и валили всю рассылку: отправлено 0 из N, автор видел повисшее
+    «Рассылаю…», а осиротевшие задачи продолжали слать уроки в фоне.
+    """
+    first = await _register(database, 9902, "Алиса")
+    second = await _register(database, 9904, "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = _MembershipBot(
+        outbox=settings.storage_path / f"outbox_{type(failure).__name__}",
+        members={first.tg_user_id, second.tg_user_id},
+        fail_for={first.tg_user_id},
+        failure=failure,
+    )
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-100500
+    ).run(LessonSpec.of(lesson), students)
+
+    # Оба получают материал: у одного проверка сломалась, второго это не касается.
+    assert report.sent == 2, f"рассылка пострадала из-за {type(failure).__name__}"
+    assert bot.delivered_to(first.tg_user_id) != []
+    assert bot.delivered_to(second.tg_user_id) != []
+    assert report.skipped == []
+
+
+async def test_check_is_skipped_when_group_not_configured(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Без VSA_GROUP_ID лишних запросов к Telegram быть не должно."""
+    student = await _register(database, 9903, "Алиса")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = _MembershipBot(outbox=settings.storage_path / "outbox_nogate", members=set())
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    assert report.sent == 1
+    assert bot.checked == [], "проверку членства дёргать незачем"
+    assert bot.delivered_to(student.tg_user_id) != []
+
+
+async def test_repeat_broadcast_keeps_proof_of_earlier_delivery(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Повторная рассылка не должна затирать запись о состоявшейся выдаче.
+
+    Ученик получил материал, потом вышел из группы. Меченая копия у него на
+    руках, и запись о ней — единственное доказательство. Заменить её на
+    «пропущен» значило бы уничтожить улику.
+    """
+    student = await _register(database, 9906, "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    spec = LessonSpec.of(lesson)
+
+    # Рассылка №1: ученик в группе, материал уходит.
+    inside = _MembershipBot(
+        outbox=settings.storage_path / "outbox_first", members={student.tg_user_id}
+    )
+    first = await _gated_broadcaster(
+        inside, engine, storage, database, settings, group_id=-100500
+    ).run(spec, students)
+    assert first.sent == 1
+
+    async with database.session_factory() as session:
+        before = await get_delivery(session, lesson_id=lesson.id, student_id=student.id)
+    assert before is not None and before.status is DeliveryStatus.SENT
+    payload = before.wm_payload
+
+    # Рассылка №2: ученик уже вышел.
+    outside = _MembershipBot(outbox=settings.storage_path / "outbox_second", members=set())
+    second = await _gated_broadcaster(
+        outside, engine, storage, database, settings, group_id=-100500
+    ).run(spec, students)
+    assert len(second.skipped) == 1
+
+    async with database.session_factory() as session:
+        after = await get_delivery(session, lesson_id=lesson.id, student_id=student.id)
+    assert after is not None
+    assert after.status is DeliveryStatus.SENT, "доказательство выдачи затёрто пропуском"
+    assert after.wm_payload == payload
+
+
+async def test_failed_delivery_still_proves_the_mark(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Сорвавшаяся отправка — тоже доказательство: копию создали именно для него.
+
+    Отчитываться «записи в журнале нет» тут неправильно: запись есть, и метка
+    в ней та самая.
+    """
+    student = await _register(database, 9907, "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+
+    payload = Payload(uid=student.uid, lesson_id=lesson.id)
+    async with database.session_factory() as session:
+        await record_delivery(
+            session,
+            lesson_id=lesson.id,
+            student_id=student.id,
+            wm_payload=payload.encode(),
+            status=DeliveryStatus.FAILED,
+            error="сеть отвалилась на середине",
+        )
+
+    marked = storage.marked(lesson.id, student.uid, 0)
+    await embed_async(engine, Path(lesson.original_image_path), marked, payload)
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(marked, admin_tg_id=1)
+
+    assert isinstance(result, TraceHit)
+    assert result.delivery_confirmed, "запись об ошибке отправки — тоже доказательство выдачи"
+
+
+async def test_progress_reaches_the_end_when_everyone_is_skipped(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Иначе сообщение автора навсегда застревает на «Рассылаю… 0/N»."""
+    await _register(database, 9908, "Первый")
+    await _register(database, 9909, "Второй")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    ticks: list[tuple[int, int]] = []
+
+    async def on_progress(done: int, total: int) -> None:
+        ticks.append((done, total))
+
+    bot = _MembershipBot(outbox=settings.storage_path / "outbox_allskipped", members=set())
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-100500
+    ).run(LessonSpec.of(lesson), students, on_progress=on_progress)
+
+    assert len(report.skipped) == 2
+    assert ticks and ticks[-1] == (2, 2), f"прогресс не доведён до конца: {ticks}"
+
+
+def test_report_warns_when_nobody_passed_the_check() -> None:
+    """Массовый пропуск — почти наверняка поломка настройки, а не исход учеников.
+
+    Без этого предупреждения автор увидел бы ровный отчёт без единого слова об
+    ошибке и узнал бы о беде от учеников.
+    """
+    report = BroadcastReport(total=3)
+    report.outcomes = [
+        DeliveryOutcome(uid=i, name=f"У{i}", ok=False, error="нет в группе курса", skipped=True)
+        for i in (1, 2, 3)
+    ]
+    text = format_report("Урок #9 разослан", report)
+    assert "Ни один ученик не прошёл проверку" in text
+    assert "администратор" in text
+
+    # А единичный пропуск — обычное дело, паниковать незачем.
+    partial = BroadcastReport(total=3)
+    partial.outcomes = [
+        DeliveryOutcome(uid=1, name="У1", ok=True),
+        DeliveryOutcome(uid=2, name="У2", ok=True),
+        DeliveryOutcome(uid=3, name="У3", ok=False, error="нет в группе курса", skipped=True),
+    ]
+    assert "Ни один ученик" not in format_report("Урок #9 разослан", partial)
 
 
 async def test_unrelated_image_is_not_attributed(

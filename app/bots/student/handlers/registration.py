@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.repo import get_student_by_tg_id, register_student
+from app.services.membership import check_membership
 from app.texts import load_offer
 from app.utils import split_text
 
@@ -30,10 +31,6 @@ router.message.filter(F.chat.type == "private")
 
 CONSENT_CALLBACK = "offer:accept"
 
-_ALLOWED_MEMBER_STATUSES = frozenset({"creator", "administrator", "member", "restricted"})
-
-#: Ошибки getChatMember, означающие «этого человека в группе нет», а не сбой.
-_NOT_A_MEMBER_ERRORS = ("PARTICIPANT_ID_INVALID", "USER_NOT_PARTICIPANT", "USER NOT FOUND")
 
 
 def _consent_keyboard() -> InlineKeyboardMarkup:
@@ -59,25 +56,6 @@ def _welcome(uid_str: str) -> str:
     )
 
 
-async def _is_group_member(bot: Bot, group_id: int, user_id: int) -> bool | None:
-    """``True`` — в группе, ``False`` — нет, ``None`` — проверить не удалось.
-
-    Различать второе и третье важно: «вас нет в группе» человек поймёт и пойдёт
-    вступать, а «не удалось проверить» отправит его писать администратору.
-    """
-    try:
-        member = await bot.get_chat_member(chat_id=group_id, user_id=user_id)
-    except TelegramBadRequest as exc:
-        text = str(exc).upper()
-        if any(marker in text for marker in _NOT_A_MEMBER_ERRORS):
-            # Telegram отвечает ошибкой, а не статусом «вышел», когда человек
-            # к группе вообще не имеет отношения. Это ответ «нет», не поломка.
-            return False
-        logger.error("проверка членства в группе %s не удалась: %s", group_id, exc)
-        return None
-    return member.status in _ALLOWED_MEMBER_STATUSES
-
-
 async def _send_offer(message: Message, settings: Settings) -> None:
     chunks = split_text(load_offer(settings.offer_path))
     for chunk in chunks[:-1]:
@@ -99,7 +77,7 @@ async def handle_start(
         return
 
     if settings.vsa_group_id is not None:
-        member = await _is_group_member(bot, settings.vsa_group_id, user.id)
+        member = await check_membership(bot, settings.vsa_group_id, user.id)
         if member is None:
             await message.answer(
                 "Не удалось проверить ваше участие в группе. "

@@ -18,6 +18,7 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
 from app.db.repo import list_active_students
@@ -138,7 +139,11 @@ async def finish_collecting(
         for chunk in split_text(caption):
             await message.answer(chunk)
 
-    lines = [f"Картинок: {len(images)}", f"Получателей: {len(students)}"]
+    lines = [f"Картинок: {len(images)}", f"Зарегистрировано учеников: {len(students)}"]
+    if settings.vsa_group_id is not None:
+        # Точное число получателей известно только в момент рассылки: членство
+        # сверяется тогда же. Обещать здесь «получателей N» было бы неправдой.
+        lines.append("Кого уже нет в группе курса — пропустим, список будет в отчёте.")
     oversized = [path for path in images if max(image_size(path)) > settings.lesson_max_side]
     if oversized:
         # Не сюрприз, а осознанный компромисс — автор должен о нём знать.
@@ -209,18 +214,7 @@ async def send_lesson(
         LessonSpec.of(lesson), students, on_progress=on_progress
     )
 
-    lines = [
-        f"<b>Урок #{lesson.id} разослан</b>",
-        f"Доставлено: {report.sent} из {report.total}",
-    ]
-    if report.failed:
-        lines.append("\n<b>Не доставлено:</b>")
-        lines.extend(
-            f"• {item.uid:04d} — {item.name}: {item.error}" for item in report.failed[:20]
-        )
-        if len(report.failed) > 20:
-            lines.append(f"…и ещё {len(report.failed) - 20}")
-    await message.answer("\n".join(lines))
+    await message.answer(format_report(f"Урок #{lesson.id} разослан", report))
 
 
 @router.callback_query(NewLesson.confirming, F.data == CANCEL_CALLBACK)

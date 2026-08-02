@@ -48,6 +48,11 @@ async def handle_stats(message: Message, session: AsyncSession) -> None:
         + "\n"
         f"Доставок: {stats.deliveries_sent} успешных"
         + (f", {stats.deliveries_failed} с ошибкой" if stats.deliveries_failed else "")
+        + (
+            f", {stats.deliveries_skipped} пропущено (нет в группе)"
+            if stats.deliveries_skipped
+            else ""
+        )
         + "\n"
         f"Трассировок: {stats.traces_total} "
         f"(метка найдена в {stats.traces_success})\n"

@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import DeliveryStatus, Lesson, Student, StudentStatus
 from app.db.repo import record_delivery, set_student_status
+from app.services.membership import is_group_member
 from app.services.storage import Storage
 from app.watermark import Payload, WatermarkEngine, WatermarkError, embed_async
 
@@ -61,6 +62,8 @@ class DeliveryOutcome:
     name: str
     ok: bool
     error: str | None = None
+    skipped: bool = False
+    """Пропущен осознанно, а не из-за сбоя. Автору это надо показывать иначе."""
 
 
 @dataclass(slots=True)
@@ -74,7 +77,11 @@ class BroadcastReport:
 
     @property
     def failed(self) -> list[DeliveryOutcome]:
-        return [outcome for outcome in self.outcomes if not outcome.ok]
+        return [o for o in self.outcomes if not o.ok and not o.skipped]
+
+    @property
+    def skipped(self) -> list[DeliveryOutcome]:
+        return [o for o in self.outcomes if o.skipped]
 
 
 class RateLimiter:
@@ -116,6 +123,7 @@ class LessonBroadcaster:
         rate_interval: float,
         workers: int,
         protect_content: bool = True,
+        group_id: int | None = None,
     ) -> None:
         self._bot = bot
         self._engine = engine
@@ -124,6 +132,7 @@ class LessonBroadcaster:
         self._limiter = RateLimiter(rate_interval)
         self._embed_slots = asyncio.Semaphore(workers)
         self._protect = protect_content
+        self._group_id = group_id
 
     async def run(
         self,
@@ -133,26 +142,142 @@ class LessonBroadcaster:
         on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> BroadcastReport:
         report = BroadcastReport(total=len(students))
-        done = 0
+        entitled = await self._filter_entitled(lesson, students, report)
+        done = len(report.outcomes)
+        if on_progress is not None:
+            # Пропущенные — уже сделанная часть работы. Без этого тика, когда
+            # отсеяли всех, сообщение автора навсегда осталось бы на «0/N».
+            await on_progress(done, report.total)
 
         # Ученики обрабатываются параллельно: пока одна копия метится (CPU),
         # другая уже уходит в сеть. Отправку сериализует RateLimiter.
         async def worker(student: Student) -> None:
             nonlocal done
-            outcome = await self._deliver(lesson, student)
+            try:
+                outcome = await self._deliver(lesson, student)
+            except Exception as exc:  # noqa: BLE001 - осечка на одном не рвёт рассылку
+                logger.exception("непредвиденный сбой на ученике %s", student.uid_str)
+                outcome = DeliveryOutcome(
+                    uid=student.uid, name=student.display_name, ok=False, error=str(exc)
+                )
             report.outcomes.append(outcome)
             done += 1
             if on_progress is not None:
                 await on_progress(done, report.total)
 
-        await asyncio.gather(*(worker(student) for student in students))
+        # return_exceptions: даже если воркер как-то умудрится бросить, остальные
+        # доработают, а автор получит отчёт вместо повисшего «Рассылаю…».
+        await asyncio.gather(
+            *(worker(student) for student in entitled), return_exceptions=True
+        )
         logger.info(
-            "рассылка урока %d завершена: %d/%d",
+            "рассылка материала %d завершена: %d/%d, пропущено вне группы: %d",
             lesson.lesson_id,
             report.sent,
             report.total,
+            len(report.skipped),
         )
         return report
+
+    async def _filter_entitled(
+        self,
+        lesson: LessonSpec,
+        students: Sequence[Student],
+        report: BroadcastReport,
+    ) -> list[Student]:
+        """Отсеять тех, кого уже нет в группе курса.
+
+        Проверка на входе закрывает только вход: кто вышел или кого исключили
+        за неоплату, иначе продолжал бы получать материалы бесконечно.
+
+        Отдельным проходом до рассылки, а не по ходу: так автор в отчёте видит
+        полный список пропущенных, а не узнаёт о них вперемешку с отправками.
+
+        При сбое самой проверки материал ВЫДАЁТСЯ. Здесь это правильнее, чем на
+        регистрации: там отказ человек переживёт и повторит попытку, а тут из-за
+        случайной ошибки API оплативший ученик молча не получил бы урок.
+        """
+        if self._group_id is None:
+            return list(students)
+
+        verdicts = await asyncio.gather(
+            *(self._entitled(student) for student in students), return_exceptions=True
+        )
+
+        kept: list[Student] = []
+        for student, verdict in zip(students, verdicts, strict=True):
+            if isinstance(verdict, BaseException):
+                # Сюда попадаем, только если сбой пережил повторы в _call.
+                logger.error(
+                    "членство uid=%s не проверено (%s) — выдаём материал, "
+                    "чтобы не наказать ученика за сбой",
+                    student.uid_str,
+                    verdict,
+                )
+                kept.append(student)
+                continue
+            if verdict:
+                kept.append(student)
+            else:
+                # Запись пропуска в базу тоже может не удаться (SQLITE_BUSY,
+                # диск). Это не повод лишать урока остальных: сам факт пропуска
+                # уже известен и попадёт в отчёт.
+                try:
+                    outcome = await self._skip(lesson, student)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("не записан пропуск uid=%s", student.uid_str)
+                    outcome = DeliveryOutcome(
+                        uid=student.uid,
+                        name=student.display_name,
+                        ok=False,
+                        error=f"нет в группе курса; запись в журнал не удалась: {exc}",
+                        skipped=True,
+                    )
+                report.outcomes.append(outcome)
+        return kept
+
+    async def _entitled(self, student: Student) -> bool:
+        """Один запрос о членстве — через ту же очередь и повторы, что и отправки."""
+        assert self._group_id is not None
+        return await self._call(
+            is_group_member,
+            bot=self._bot,
+            group_id=self._group_id,
+            user_id=student.tg_user_id,
+        )
+
+    async def _skip(self, lesson: LessonSpec, student: Student) -> DeliveryOutcome:
+        """Записать осознанный пропуск.
+
+        wm_payload остаётся пустым намеренно: меченой копии не создавали, и
+        подставлять сюда метку нельзя — трассировка по такой записи решила бы,
+        что материал ученику выдавали.
+        """
+        async with self._session_factory() as session:
+            await record_delivery(
+                session,
+                lesson_id=lesson.lesson_id,
+                student_id=student.id,
+                wm_payload="",
+                status=DeliveryStatus.SKIPPED,
+                error="нет в группе курса",
+                # Существующую запись не трогаем: если материал когда-то реально
+                # выдавали, копия у ученика на руках и запись о ней — единственное
+                # доказательство выдачи.
+                overwrite=False,
+            )
+        logger.info(
+            "материал %d не выдан uid=%s: нет в группе курса",
+            lesson.lesson_id,
+            student.uid_str,
+        )
+        return DeliveryOutcome(
+            uid=student.uid,
+            name=student.display_name,
+            ok=False,
+            error="нет в группе курса",
+            skipped=True,
+        )
 
     async def _deliver(self, lesson: LessonSpec, student: Student) -> DeliveryOutcome:
         payload = Payload(uid=student.uid, lesson_id=lesson.lesson_id)

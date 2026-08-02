@@ -218,8 +218,15 @@ async def record_delivery(
     status: DeliveryStatus,
     tg_message_id: int | None = None,
     error: str | None = None,
+    overwrite: bool = True,
 ) -> None:
-    """Записать доставку. Повторная рассылка того же урока обновляет запись."""
+    """Записать доставку. Повторная рассылка того же урока обновляет запись.
+
+    ``overwrite=False`` оставляет уже существующую запись нетронутой. Так пишут
+    пропуски: если материал ученику когда-то реально выдавали, эта запись —
+    доказательство выдачи, и затирать её более поздним «нет в группе» нельзя.
+    Меченая копия к тому моменту уже у него на руках.
+    """
     statement = sqlite_insert(Delivery).values(
         lesson_id=lesson_id,
         student_id=student_id,
@@ -229,9 +236,10 @@ async def record_delivery(
         error=error,
         delivered_at=utcnow(),
     )
-    await session.execute(
-        statement.on_conflict_do_update(
-            index_elements=[Delivery.lesson_id, Delivery.student_id],
+    index = [Delivery.lesson_id, Delivery.student_id]
+    if overwrite:
+        statement = statement.on_conflict_do_update(
+            index_elements=index,
             set_={
                 "wm_payload": statement.excluded.wm_payload,
                 "status": statement.excluded.status,
@@ -240,7 +248,9 @@ async def record_delivery(
                 "delivered_at": statement.excluded.delivered_at,
             },
         )
-    )
+    else:
+        statement = statement.on_conflict_do_nothing(index_elements=index)
+    await session.execute(statement)
     await session.commit()
 
 
@@ -359,6 +369,7 @@ class Stats:
     answers: int
     deliveries_sent: int
     deliveries_failed: int
+    deliveries_skipped: int
     questions_open: int
     traces_total: int
     traces_success: int
@@ -391,6 +402,9 @@ async def collect_stats(session: AsyncSession) -> Stats:
     failed = await scalar(
         select(func.count()).select_from(Delivery).where(Delivery.status == DeliveryStatus.FAILED)
     )
+    skipped = await scalar(
+        select(func.count()).select_from(Delivery).where(Delivery.status == DeliveryStatus.SKIPPED)
+    )
     traces_total = await scalar(select(func.count()).select_from(TraceAttempt))
     traces_success = await scalar(
         select(func.count()).select_from(TraceAttempt).where(TraceAttempt.success.is_(True))
@@ -404,6 +418,7 @@ async def collect_stats(session: AsyncSession) -> Stats:
         answers=answers,
         deliveries_sent=sent,
         deliveries_failed=failed,
+        deliveries_skipped=skipped,
         questions_open=questions_open,
         traces_total=traces_total,
         traces_success=traces_success,

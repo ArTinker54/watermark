@@ -23,6 +23,7 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
 from app.db import Question, QuestionStatus, Student
@@ -193,6 +194,9 @@ async def finish_answer(
             await message.answer(chunk)
 
     lines = [f"Получателей: {len(recipients)}"]
+    if settings.vsa_group_id is not None:
+        # И для личного ответа тоже: спросивший мог выйти из группы после вопроса.
+        lines.append("Кого уже нет в группе курса — пропустим, список будет в отчёте.")
     if any(max(image_size(path)) > settings.lesson_max_side for path in images):
         lines.append(
             f"Длинная сторона будет уменьшена до {settings.lesson_max_side} px: "
@@ -264,7 +268,6 @@ async def send_answer(
         question_id=question.id,
     )
     Storage.drop_staging(Path(data["staging"]))
-    await set_question_status(session, question, QuestionStatus.ANSWERED)
     await state.clear()
 
     if not recipients:
@@ -272,14 +275,18 @@ async def send_answer(
         return
 
     report = await broadcaster.run(LessonSpec.of(lesson), recipients)
-    lines = [
-        f"<b>Ответ на вопрос №{question.id} отправлен</b>",
-        f"Доставлено: {report.sent} из {report.total}",
-    ]
-    if report.failed:
-        lines.append("\n<b>Не доставлено:</b>")
-        lines.extend(f"• {item.uid:04d} — {item.name}: {item.error}" for item in report.failed[:20])
-    await message.answer("\n".join(lines))
+
+    # Отвеченным помечаем только после реальной доставки. Иначе вопрос ученика,
+    # который к этому моменту вышел из группы, исчез бы из /questions, хотя
+    # ответа он так и не получил.
+    if report.sent:
+        await set_question_status(session, question, QuestionStatus.ANSWERED)
+
+    await message.answer(format_report(f"Ответ на вопрос №{question.id} отправлен", report))
+    if not report.sent:
+        await message.answer(
+            f"Вопрос №{question.id} остался открытым — ответ никому не дошёл."
+        )
 
 
 def _compose(question: Question, *, body: str | None, audience: str, with_name: bool) -> str:

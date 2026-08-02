@@ -24,7 +24,7 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db import Lesson, LessonImage, Student
+from app.db import Delivery, DeliveryStatus, Lesson, LessonImage, Student
 from app.db.repo import get_delivery, get_student_by_uid, list_lessons, log_trace_attempt
 from app.watermark import (
     READABLE_SCALE,
@@ -54,8 +54,22 @@ class TraceHit:
     student: Student | None
     confidence: float
     box: tuple[int, int, int, int]
-    delivery_confirmed: bool
-    """True — в журнале есть запись, что этому ученику этот урок правда выдавался."""
+    delivery: Delivery | None
+    """Запись журнала об этой выдаче, если она есть."""
+
+    @property
+    def delivery_confirmed(self) -> bool:
+        """Выдавался ли материал этому ученику с этой меткой.
+
+        Неудачная отправка тоже считается: копию сгенерировали и записали, а
+        часть сообщения могла дойти. Не считается только пропуск — там метки
+        не создавали вовсе.
+        """
+        return (
+            self.delivery is not None
+            and self.delivery.status is not DeliveryStatus.SKIPPED
+            and self.delivery.wm_payload == self.payload.encode()
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,12 +301,11 @@ class TraceService:
     ) -> TraceHit:
         async with self._session_factory() as session:
             student = await get_student_by_uid(session, payload.uid)
-            confirmed = False
+            delivery = None
             if student is not None:
                 delivery = await get_delivery(
                     session, lesson_id=candidate.lesson.id, student_id=student.id
                 )
-                confirmed = delivery is not None and delivery.wm_payload == payload.encode()
 
         return TraceHit(
             payload=payload,
@@ -300,7 +313,7 @@ class TraceService:
             student=student,
             confidence=confidence,
             box=box,
-            delivery_confirmed=confirmed,
+            delivery=delivery,
         )
 
     async def _try_candidate(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:

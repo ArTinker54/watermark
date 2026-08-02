@@ -52,6 +52,8 @@ class StudentStatus(enum.StrEnum):
 class DeliveryStatus(enum.StrEnum):
     SENT = "sent"
     FAILED = "failed"
+    SKIPPED = "skipped"
+    """Не отправляли осознанно — например, ученик вышел из группы курса."""
 
 
 class QuestionStatus(enum.StrEnum):

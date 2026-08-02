@@ -48,6 +48,7 @@ def build_admin(
         rate_interval=settings.send_interval,
         workers=settings.wm_workers,
         protect_content=settings.protect_content,
+        group_id=settings.vsa_group_id,
     )
     dispatcher["tracer"] = TraceService(
         engine=engine,

@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
 from app.bots.files import ImageRejected, download_image, extract_file_id
+from app.db import DeliveryStatus
 from app.services import Storage, TraceHit, TraceMiss, TraceResult, TraceService
 from app.utils import format_dt
 from app.watermark import READABLE_SCALE
@@ -111,11 +112,32 @@ def _format_hit(hit: TraceHit) -> str:
         f"Область на картинке: {width}×{height} в точке ({x}, {y})",
     ]
 
-    if hit.delivery_confirmed:
-        lines.append("Доставка подтверждена журналом.")
-    else:
-        lines.append(
-            "Записи о такой доставке в журнале нет — проверьте, "
+    lines.append(_delivery_note(hit))
+    return "\n".join(lines)
+
+
+def _delivery_note(hit: TraceHit) -> str:
+    """Что говорит журнал о выдаче именно этой копии.
+
+    Три разных случая, и путать их нельзя: запись об успешной выдаче, запись об
+    ошибке (копию сделали и записали, но отправка сорвалась — метка всё равно
+    его) и отсутствие записи вовсе.
+    """
+    delivery = hit.delivery
+    if delivery is None or delivery.wm_payload != hit.payload.encode():
+        return (
+            "Записи о такой выдаче в журнале нет — проверьте, "
             "не пересылался ли материал вручную."
         )
-    return "\n".join(lines)
+    if delivery.status is DeliveryStatus.SENT:
+        return "Выдача подтверждена журналом."
+    if delivery.status is DeliveryStatus.FAILED:
+        return (
+            "В журнале запись об ошибке отправки: копия с этой меткой была "
+            f"сделана именно для него ({format_dt(delivery.delivered_at)}), "
+            "но доставка сорвалась. Метка всё равно его."
+        )
+    return (
+        "В журнале запись о пропуске: копию для него не создавали. "
+        "Похоже, материал попал к нему не через бота."
+    )

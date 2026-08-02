@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
-from aiogram import Router
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Chat
+from aiogram import Bot, Router
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from aiogram.types import Chat, ChatMemberRestricted, User
 
 from app.bots.student.handlers import common, registration
 from app.bots.student.handlers.chats import handle_group_id, on_membership_change
-from app.bots.student.handlers.registration import _is_group_member
 from app.config import Settings
+from app.services.membership import check_membership, counts_as_member, is_group_member
 
 
 class _FakeMember:
@@ -134,26 +142,62 @@ async def test_groupid_ignores_linked_channel() -> None:
 
 
 class _FakeMemberBot:
-    """Заглушка getChatMember: отдаёт статус или роняет ошибку Telegram."""
+    """Заглушка getChatMember: отдаёт участника или роняет ошибку Telegram."""
 
-    def __init__(self, *, status: str | None = None, error: str | None = None) -> None:
-        self._status = status
+    def __init__(self, *, member: object = None, error: Exception | None = None) -> None:
+        self._member = member
         self._error = error
 
     async def get_chat_member(self, chat_id: int, user_id: int) -> object:
         if self._error is not None:
-            raise TelegramBadRequest(method=Mock(), message=self._error)
-        return SimpleNamespace(status=self._status)
+            raise self._error
+        return self._member
+
+
+def _member(status: str, **extra: object) -> object:
+    return SimpleNamespace(status=status, **extra)
+
+
+#: Сбои, при которых членство определить нельзя. Все они — СЁСТРЫ
+#: TelegramBadRequest по TelegramAPIError, а не потомки, поэтому узкий
+#: except TelegramBadRequest их не ловил и они рвали рассылку целиком.
+TRANSIENT = [
+    TelegramRetryAfter(method=Mock(), message="Too Many Requests", retry_after=5),
+    TelegramForbiddenError(method=Mock(), message="Forbidden: bot was kicked"),
+    TelegramNetworkError(method=Mock(), message="Request timeout"),
+    TelegramServerError(method=Mock(), message="Bad Gateway"),
+    TelegramBadRequest(method=Mock(), message="Bad Request: chat not found"),
+]
 
 
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [("creator", True), ("administrator", True), ("member", True), ("restricted", True),
+    [("creator", True), ("administrator", True), ("member", True),
      ("left", False), ("kicked", False)],
 )
 async def test_membership_by_status(status: str, expected: bool) -> None:
-    result = await _is_group_member(_FakeMemberBot(status=status), -100, 42)  # type: ignore[arg-type]
-    assert result is expected
+    bot = cast("Bot", _FakeMemberBot(member=_member(status)))
+    assert await is_group_member(bot, -100, 42) is expected
+
+
+@pytest.mark.parametrize("is_member", [True, False])
+async def test_restricted_decided_by_is_member(is_member: bool) -> None:
+    """Ограниченному статус остаётся restricted и после выхода из группы.
+
+    Флаг is_member есть только у этого варианта — как раз потому, что статус
+    сам по себе тут ничего не говорит. Без него выбывший проходил бы как свой,
+    то есть ровно тот случай, ради которого гейт и делался.
+    """
+    bot = cast("Bot", _FakeMemberBot(member=_member("restricted", is_member=is_member)))
+    assert await is_group_member(bot, -100, 42) is is_member
+
+
+async def test_restricted_on_real_model() -> None:
+    """То же на настоящей модели aiogram, а не на самодельной заглушке."""
+    left = ChatMemberRestricted.model_construct(
+        status="restricted", user=User(id=42, is_bot=False, first_name="Никита"), is_member=False
+    )
+    assert counts_as_member(left) is False
 
 
 async def test_absent_user_is_not_a_failure() -> None:
@@ -162,14 +206,27 @@ async def test_absent_user_is_not_a_failure() -> None:
     Это ответ «нет», и человеку надо сказать «вступите в группу», а не гнать его
     к администратору с жалобой на поломку.
     """
-    bot = _FakeMemberBot(error="Bad Request: PARTICIPANT_ID_INVALID")
-    assert await _is_group_member(bot, -100, 42) is False  # type: ignore[arg-type]
+    error = TelegramBadRequest(method=Mock(), message="Bad Request: PARTICIPANT_ID_INVALID")
+    bot = cast("Bot", _FakeMemberBot(error=error))
+    assert await is_group_member(bot, -100, 42) is False
 
 
-async def test_real_failure_stays_unknown() -> None:
-    """Настоящий сбой не должен маскироваться под «вас нет в группе»."""
-    bot = _FakeMemberBot(error="Bad Request: chat not found")
-    assert await _is_group_member(bot, -100, 42) is None  # type: ignore[arg-type]
+@pytest.mark.parametrize("error", TRANSIENT, ids=lambda e: type(e).__name__)
+async def test_transient_failure_is_unknown_not_absent(error: Exception) -> None:
+    """Сбой обязан отличаться от «нет в группе», иначе своих начнут выгонять."""
+    bot = cast("Bot", _FakeMemberBot(error=error))
+    assert await check_membership(bot, -100, 42) is None
+
+
+@pytest.mark.parametrize("error", TRANSIENT, ids=lambda e: type(e).__name__)
+async def test_transient_failure_propagates_from_low_level(error: Exception) -> None:
+    """is_group_member пробрасывает сбой: решение о нём принимает вызывающий.
+
+    У регистрации и у рассылки это решение разное, поэтому оно не здесь.
+    """
+    bot = cast("Bot", _FakeMemberBot(error=error))
+    with pytest.raises(TelegramAPIError):
+        await is_group_member(bot, -100, 42)
 
 
 async def test_private_chat_is_ignored(caplog: pytest.LogCaptureFixture) -> None:
