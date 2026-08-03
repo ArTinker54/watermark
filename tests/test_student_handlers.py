@@ -22,7 +22,12 @@ from aiogram.types import Chat, ChatMemberRestricted, User
 from app.bots.student.handlers import common, registration
 from app.bots.student.handlers.chats import handle_group_id, on_membership_change
 from app.config import Settings
-from app.services.membership import check_membership, counts_as_member, is_group_member
+from app.services.membership import (
+    CourseUnreachable,
+    check_membership,
+    counts_as_member,
+    is_group_member,
+)
 
 
 class _FakeMember:
@@ -163,12 +168,19 @@ def _member(status: str, **extra: object) -> object:
 #: Сбои, при которых членство определить нельзя. Все они — СЁСТРЫ
 #: TelegramBadRequest по TelegramAPIError, а не потомки, поэтому узкий
 #: except TelegramBadRequest их не ловил и они рвали рассылку целиком.
+#: Случайные сбои: связь, лимиты, пятисотки. Повтор имеет смысл.
 TRANSIENT = [
     TelegramRetryAfter(method=Mock(), message="Too Many Requests", retry_after=5),
-    TelegramForbiddenError(method=Mock(), message="Forbidden: bot was kicked"),
     TelegramNetworkError(method=Mock(), message="Request timeout"),
     TelegramServerError(method=Mock(), message="Bad Gateway"),
+    TelegramBadRequest(method=Mock(), message="Bad Request: query is too old"),
+]
+
+#: Постоянные: чата нет, бота оттуда выкинули. Повторять бесполезно, и —
+#: главное — считать всех участниками на этом основании нельзя.
+PERMANENT = [
     TelegramBadRequest(method=Mock(), message="Bad Request: chat not found"),
+    TelegramForbiddenError(method=Mock(), message="Forbidden: bot was kicked"),
 ]
 
 
@@ -213,9 +225,12 @@ async def test_absent_user_is_not_a_failure() -> None:
     assert await is_group_member(bot, -100, 42) is False
 
 
-@pytest.mark.parametrize("error", TRANSIENT, ids=lambda e: type(e).__name__)
-async def test_transient_failure_is_unknown_not_absent(error: Exception) -> None:
-    """Сбой обязан отличаться от «нет в группе», иначе своих начнут выгонять."""
+@pytest.mark.parametrize("error", TRANSIENT + PERMANENT, ids=lambda e: str(e)[:32])
+async def test_failure_is_unknown_not_absent(error: Exception) -> None:
+    """Сбой обязан отличаться от «нет в группе», иначе своих начнут выгонять.
+
+    На регистрации это верно для любой причины: и случайной, и постоянной.
+    """
     bot = cast("Bot", _FakeMemberBot(error=error))
     assert await check_membership(bot, -100, 42) is None
 
@@ -228,6 +243,18 @@ async def test_transient_failure_propagates_from_low_level(error: Exception) -> 
     """
     bot = cast("Bot", _FakeMemberBot(error=error))
     with pytest.raises(TelegramAPIError):
+        await is_group_member(bot, -100, 42)
+
+
+@pytest.mark.parametrize("error", PERMANENT, ids=lambda e: str(e)[:32])
+async def test_unreachable_chat_is_told_apart_from_a_hiccup(error: Exception) -> None:
+    """Недоступный чат — отдельный вид беды, и назван он отдельно.
+
+    Иначе он попадает под правило «не смогли проверить, значит выдаём», и
+    материал уходит вообще всем, включая тех, кто из курса вышел.
+    """
+    bot = cast("Bot", _FakeMemberBot(error=error))
+    with pytest.raises(CourseUnreachable):
         await is_group_member(bot, -100, 42)
 
 

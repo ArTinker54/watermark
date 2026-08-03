@@ -776,10 +776,9 @@ async def test_skipped_record_is_not_proof_of_delivery(
     "failure",
     [
         TelegramRetryAfter(method=Mock(), message="Too Many Requests", retry_after=1),
-        TelegramForbiddenError(method=Mock(), message="Forbidden: bot was kicked"),
         TelegramNetworkError(method=Mock(), message="Request timeout"),
         TelegramServerError(method=Mock(), message="Bad Gateway"),
-        TelegramBadRequest(method=Mock(), message="Bad Request: chat not found"),
+        TelegramBadRequest(method=Mock(), message="Bad Request: query is too old"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -791,12 +790,15 @@ async def test_check_failure_never_breaks_the_broadcast(
     lesson_source: Path,
     failure: Exception,
 ) -> None:
-    """Сбой проверки у ОДНОГО ученика не должен ни ронять рассылку, ни лишать его урока.
+    """СЛУЧАЙНЫЙ сбой у одного ученика не рушит рассылку и не лишает его урока.
 
     Все эти исключения — сёстры TelegramBadRequest по TelegramAPIError, а не
     потомки. Узкий перехват ловил лишь последнее из них, остальные пролетали
     насквозь и валили всю рассылку: отправлено 0 из N, автор видел повисшее
     «Рассылаю…», а осиротевшие задачи продолжали слать уроки в фоне.
+
+    Постоянная поломка чата курса сюда не входит намеренно — у неё обратное
+    поведение, см. test_broken_course_stops_the_broadcast_instead_of_sending_to_everyone.
     """
     first = await _register(database, 9902, "Алиса")
     second = await _register(database, 9904, "Борис")
@@ -1553,7 +1555,7 @@ async def test_lesson_without_course_goes_to_everyone(
         )
         students = list(await list_active_students(session))
 
-    assert LessonSpec.of(lesson).course_chat_id is None
+    assert LessonSpec.of(lesson).course_chats == ()
 
     bot = _CoursesBot(settings.storage_path / "out_nocourse", {})
     report = await _gated_broadcaster(
@@ -1647,3 +1649,125 @@ async def test_partial_extraction_is_rejected(
 
     assert isinstance(result, TraceMiss)
     assert "не читается" in result.reason
+
+
+class _BrokenCourseBot(FakeBot):
+    """Чат курса недоступен: неверный id или бота оттуда выкинули."""
+
+    def __init__(self, outbox: Path, error: Exception) -> None:
+        super().__init__(outbox=outbox)
+        self.error = error
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> Any:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TelegramBadRequest(method=Mock(), message="Bad Request: chat not found"),
+        TelegramForbiddenError(method=Mock(), message="Forbidden: bot is not a member"),
+    ],
+    ids=["чат не найден", "бота нет в чате"],
+)
+async def test_broken_course_stops_the_broadcast_instead_of_sending_to_everyone(
+    database,
+    storage: Storage,
+    engine: WatermarkEngine,
+    settings: Settings,
+    lesson_source: Path,
+    error: Exception,
+) -> None:
+    """Неисправный чат курса обязан отменить рассылку, а не раздать материал всем.
+
+    Сбой проверки трактуется как «выдать» намеренно — чтобы мигнувшая сеть не
+    лишила ученика урока. Но постоянная поломка настройки под это правило
+    попадать не должна: материал ушёл бы вообще всем, включая вышедших, а отчёт
+    остался бы чистым.
+    """
+    await _register(database, 9970, "Первый")
+    await _register(database, 9971, "Второй")
+
+    async with database.session_factory() as session:
+        course = await add_course(session, title="Курс", chat_id=-1009)
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+            course_id=course.id,
+        )
+        students = list(await list_active_students(session))
+
+    bot = _BrokenCourseBot(settings.storage_path / "out_broken", error)
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=None
+    ).run(LessonSpec.of(lesson), students)
+
+    assert report.aborted is not None, "рассылка обязана остановиться"
+    assert report.sent == 0
+    assert bot.sent == [], "материал не должен уйти никому"
+    assert "НЕ РАЗОСЛАН" in format_report("Урок #1 разослан", report)
+
+
+async def test_answer_reaches_a_student_of_any_course(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Личный ответ доходит до спросившего, в каком бы курсе он ни состоял.
+
+    Раньше у ответа не было курса, допуск сваливался на единственную группу из
+    настроек, и подписчику второго курса ответить было нельзя в принципе.
+    """
+    asker = await _register(database, 9960, "Из второго курса")
+
+    async with database.session_factory() as session:
+        first = await add_course(session, title="Первый", chat_id=-1001)
+        second = await add_course(session, title="Второй", chat_id=-1002)
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        chats = [first.chat_id, second.chat_id]
+
+    # Спросивший состоит только во втором курсе.
+    bot = _CoursesBot(settings.storage_path / "out_answer", {-1002: {asker.tg_user_id}})
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-1001
+    ).run(LessonSpec.of(lesson, entitle_chats=chats), [asker])
+
+    assert report.sent == 1, "членства во втором курсе достаточно для ответа"
+    assert bot.delivered_to(asker.tg_user_id)
+
+
+async def test_answer_still_skips_someone_who_left_every_course(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Вышедший из всех курсов ответа не получает — гейт остаётся на месте."""
+    gone = await _register(database, 9961, "Ушёл отовсюду")
+
+    async with database.session_factory() as session:
+        first = await add_course(session, title="Первый", chat_id=-1001)
+        second = await add_course(session, title="Второй", chat_id=-1002)
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        chats = [first.chat_id, second.chat_id]
+
+    bot = _CoursesBot(settings.storage_path / "out_answer_gone", {})
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=-1001
+    ).run(LessonSpec.of(lesson, entitle_chats=chats), [gone])
+
+    assert report.sent == 0
+    assert len(report.skipped) == 1

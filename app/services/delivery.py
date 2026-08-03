@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import DeliveryStatus, Lesson, Student, StudentStatus
 from app.db.repo import record_delivery, set_student_status
-from app.services.membership import is_group_member
+from app.services.membership import CourseUnreachable, is_group_member
 from app.services.storage import Storage
 from app.watermark import Payload, WatermarkEngine, WatermarkError, embed_async
 from app.watermark.text import embed as text_embed
@@ -50,18 +50,28 @@ class LessonSpec:
     images: tuple[Path, ...]
     video_file_id: str | None = None
     video_kind: str | None = None
-    course_chat_id: int | None = None
-    """Чат курса, членство в котором даёт право на этот материал."""
+    course_chats: tuple[int, ...] = ()
+    """Чаты, членство в ЛЮБОМ из которых даёт право на этот материал."""
 
     @classmethod
-    def of(cls, lesson: Lesson) -> LessonSpec:
+    def of(cls, lesson: Lesson, *, entitle_chats: Sequence[int] = ()) -> LessonSpec:
+        """Снимок урока. ``entitle_chats`` — на случай материала без курса.
+
+        У урока курс выбирает автор, и тогда допуск считается по нему одному.
+        Но у ответа на вопрос курса нет: человек спросил — человеку отвечают,
+        и право на ответ даёт членство в любом из его курсов. Без этого списка
+        допуск сваливался бы на единственную старую группу из настроек, и
+        ученику второго курса ответ не доходил бы никогда.
+        """
         return cls(
             lesson_id=lesson.id,
             caption=lesson.caption,
             images=tuple(Path(image.path) for image in lesson.images),
             video_file_id=lesson.video_file_id,
             video_kind=lesson.video_kind,
-            course_chat_id=lesson.course.chat_id if lesson.course else None,
+            course_chats=(
+                (lesson.course.chat_id,) if lesson.course else tuple(entitle_chats)
+            ),
         )
 
     @property
@@ -84,6 +94,8 @@ class DeliveryOutcome:
 class BroadcastReport:
     total: int
     outcomes: list[DeliveryOutcome] = field(default_factory=list)
+    aborted: str | None = None
+    """Рассылка не состоялась целиком: проверить допуск было нечем."""
 
     @property
     def sent(self) -> int:
@@ -156,7 +168,16 @@ class LessonBroadcaster:
         on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> BroadcastReport:
         report = BroadcastReport(total=len(students))
-        entitled = await self._filter_entitled(lesson, students, report)
+        try:
+            entitled = await self._filter_entitled(lesson, students, report)
+        except CourseUnreachable as exc:
+            # Гейт неисправен: id чата неверный, бота там нет или разжаловали.
+            # Раздать материал всем в такой ситуации — ровно то, ради чего гейт
+            # и делался. Лучше не разослать ничего и сказать об этом прямо.
+            logger.error("рассылка материала %d отменена: %s", lesson.lesson_id, exc)
+            report.aborted = str(exc)
+            return report
+
         done = len(report.outcomes)
         if on_progress is not None:
             # Пропущенные — уже сделанная часть работы. Без этого тика, когда
@@ -207,15 +228,20 @@ class LessonBroadcaster:
         Отдельным проходом до рассылки, а не по ходу: так автор в отчёте видит
         полный список пропущенных, а не узнаёт о них вперемешку с отправками.
 
-        При сбое самой проверки материал ВЫДАЁТСЯ. Здесь это правильнее, чем на
-        регистрации: там отказ человек переживёт и повторит попытку, а тут из-за
-        случайной ошибки API оплативший ученик молча не получил бы урок.
+        При СЛУЧАЙНОМ сбое проверки материал ВЫДАЁТСЯ. Здесь это правильнее, чем
+        на регистрации: там отказ человек переживёт и повторит попытку, а тут
+        из-за мигнувшей сети оплативший ученик молча не получил бы урок.
+
+        А вот постоянная неисправность чата курса выдачей не прикрывается: она
+        летит наверх и отменяет рассылку целиком (см. ``CourseUnreachable``).
         """
-        gate = lesson.course_chat_id if lesson.course_chat_id is not None else self._group_id
-        if gate is None:
+        gates = lesson.course_chats or (
+            () if self._group_id is None else (self._group_id,)
+        )
+        if not gates:
             return list(students)
 
-        kept, dropped = await self.split_by_membership(students, chat_id=gate)
+        kept, dropped = await self.split_by_membership(students, chat_ids=gates)
         for student in dropped:
             # Запись пропуска в базу тоже может не удаться (SQLITE_BUSY, диск).
             # Это не повод лишать урока остальных: сам факт пропуска уже
@@ -235,24 +261,32 @@ class LessonBroadcaster:
         return kept
 
     async def split_by_membership(
-        self, students: Sequence[Student], *, chat_id: int | None = None
+        self, students: Sequence[Student], *, chat_ids: Sequence[int] | None = None
     ) -> tuple[list[Student], list[Student]]:
-        """Разделить на тех, кто в чате курса, и тех, кого там уже нет.
+        """Разделить на тех, кто состоит хотя бы в одном чате, и остальных.
 
         Ничего не пишет в базу — годится и для рассылки, и для того, чтобы
         просто посмотреть текущее число получателей.
+
+        Бросает ``CourseUnreachable``, если чат недоступен как таковой: считать
+        в этом случае всех участниками нельзя.
         """
-        gate = chat_id if chat_id is not None else self._group_id
-        if gate is None:
+        gates = tuple(chat_ids) if chat_ids else (
+            () if self._group_id is None else (self._group_id,)
+        )
+        if not gates:
             return list(students), []
 
         verdicts = await asyncio.gather(
-            *(self._entitled(student, gate) for student in students), return_exceptions=True
+            *(self._entitled(student, gates) for student in students),
+            return_exceptions=True,
         )
 
         kept: list[Student] = []
         dropped: list[Student] = []
         for student, verdict in zip(students, verdicts, strict=True):
+            if isinstance(verdict, CourseUnreachable):
+                raise verdict
             if isinstance(verdict, BaseException):
                 # Сюда попадаем, только если сбой пережил повторы в _call.
                 logger.error(
@@ -268,14 +302,21 @@ class LessonBroadcaster:
                 dropped.append(student)
         return kept, dropped
 
-    async def _entitled(self, student: Student, chat_id: int) -> bool:
-        """Один запрос о членстве — через ту же очередь и повторы, что и отправки."""
-        return await self._call(
-            is_group_member,
-            bot=self._bot,
-            group_id=chat_id,
-            user_id=student.tg_user_id,
-        )
+    async def _entitled(self, student: Student, chat_ids: Sequence[int]) -> bool:
+        """Членство хотя бы в одном из чатов — через ту же очередь, что и отправки.
+
+        Первое же «да» прекращает опрос: для допуска этого достаточно, а лишние
+        запросы к Telegram на каждого ученика заметно замедлили бы рассылку.
+        """
+        for chat_id in chat_ids:
+            if await self._call(
+                is_group_member,
+                bot=self._bot,
+                group_id=chat_id,
+                user_id=student.tg_user_id,
+            ):
+                return True
+        return False
 
     async def _skip(self, lesson: LessonSpec, student: Student) -> DeliveryOutcome:
         """Записать осознанный пропуск.

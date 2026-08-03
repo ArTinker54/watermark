@@ -20,6 +20,7 @@ from app.db.repo import (
     list_lesson_summaries,
 )
 from app.services import LessonBroadcaster
+from app.services.membership import CourseUnreachable
 from app.utils import format_dt
 
 logger = logging.getLogger(__name__)
@@ -59,12 +60,25 @@ async def show_recipients(
     )
 
     inside: dict[int, set[int]] = {}
+    broken: dict[int, str] = {}
     for course in courses:
-        members, _ = await broadcaster.split_by_membership(students, chat_id=course.chat_id)
+        try:
+            members, _ = await broadcaster.split_by_membership(
+                students, chat_ids=[course.chat_id]
+            )
+        except CourseUnreachable as exc:
+            # Курс, который нельзя проверить, — это не «ноль получателей»: по
+            # нему рассылка вообще не пойдёт, и сказать надо именно так.
+            broken[course.id] = exc.reason
+            inside[course.id] = set()
+            continue
         inside[course.id] = {student.id for student in members}
 
     lines = ["<b>Получатели по курсам</b>", f"Принято условий: {len(students)}", ""]
     for course in courses:
+        if course.id in broken:
+            lines.append(f"<b>{course.title}</b> — ⚠️ чат недоступен, рассылки не будет")
+            continue
         lines.append(f"<b>{course.title}</b> — получат {len(inside[course.id])}")
 
     # Сколько курсов приходится на человека: это и есть ответ на вопрос,
@@ -77,6 +91,19 @@ async def show_recipients(
         both = sum(1 for value in counts.values() if value > 1)
         lines.append(f"\nСразу в нескольких курсах: {both}")
 
+    if broken:
+        lines += [
+            "",
+            "⚠️ <b>Часть курсов не проверяется:</b>",
+            *(
+                f"• {course.title}: {broken[course.id]}"
+                for course in courses
+                if course.id in broken
+            ),
+            "Проверьте, что бот раздачи в чате и остаётся администратором, "
+            "а id курса совпадает с настоящим (/groupid в чате).",
+        ]
+
     orphans = [student for student in students if counts[student.id] == 0]
     if orphans:
         lines.append(f"\n<b>Ни в одном курсе ({len(orphans)}):</b>")
@@ -85,7 +112,7 @@ async def show_recipients(
         if len(orphans) > _NAMES:
             lines.append(f"…и ещё {len(orphans) - _NAMES}")
 
-    if not any(inside.values()) and len(students) > 1:
+    if not any(inside.values()) and len(students) > 1 and not broken:
         lines.append(
             "\n⚠️ Не прошёл никто ни по одному курсу. Похоже на сбой настройки: "
             "проверьте, что бот рассылки — администратор во всех чатах курсов."
@@ -109,7 +136,13 @@ async def _without_courses(
         return
 
     status = await message.answer(f"Проверяю {len(students)} учеников…")
-    inside, outside = await broadcaster.split_by_membership(students)
+    try:
+        inside, outside = await broadcaster.split_by_membership(students)
+    except CourseUnreachable as exc:
+        await status.edit_text(
+            f"⚠️ {exc.reason}\n\nПроверьте VSA_GROUP_ID и права бота раздачи в группе."
+        )
+        return
     lines = [f"<b>Получателей: {len(inside)}</b>", f"Принято условий: {len(students)}"]
     if outside:
         lines.append(f"\n<b>Не получат — нет в группе ({len(outside)}):</b>")
@@ -143,7 +176,18 @@ async def show_course_audience(
         return
 
     status = await message.answer(f"Проверяю {len(students)} учеников…")
-    inside, outside = await broadcaster.split_by_membership(students, chat_id=course.chat_id)
+    try:
+        inside, outside = await broadcaster.split_by_membership(
+            students, chat_ids=[course.chat_id]
+        )
+    except CourseUnreachable as exc:
+        await status.edit_text(
+            f"<b>{course.title}</b>\n\n⚠️ {exc.reason}\n\n"
+            "Пока это не исправлено, материалы этого курса не уйдут никому. "
+            "Проверьте, что бот раздачи в чате и остаётся администратором, "
+            "а id курса совпадает с настоящим (/groupid в чате)."
+        )
+        return
 
     lines = [
         f"<b>{course.title}</b>",

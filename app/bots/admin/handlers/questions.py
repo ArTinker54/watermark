@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -26,10 +27,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
-from app.db import Question, QuestionStatus, Student
+from app.db import Course, Question, QuestionStatus, Student
 from app.db.repo import (
+    get_course,
     get_question,
     list_active_students,
+    list_courses,
     list_open_questions,
     set_question_status,
 )
@@ -193,27 +196,59 @@ async def finish_answer(
         for chunk in split_text(caption):
             await message.answer(chunk)
 
+    courses = list(await list_courses(session))
     lines = [f"Получателей: {len(recipients)}"]
-    if settings.vsa_group_id is not None:
-        # И для личного ответа тоже: спросивший мог выйти из группы после вопроса.
-        lines.append("Кого уже нет в группе курса — пропустим, список будет в отчёте.")
+    if courses or settings.vsa_group_id is not None:
+        # И для личного ответа тоже: спросивший мог выйти из курса после вопроса.
+        lines.append("Кого уже нет в курсе — пропустим, список будет в отчёте.")
     if any(max(image_size(path)) > settings.lesson_max_side for path in images):
         lines.append(
             f"Длинная сторона будет уменьшена до {settings.lesson_max_side} px: "
             "иначе метка не читается со скриншота чата."
         )
-    await message.answer("\n".join(lines), reply_markup=_send_keyboard(audience))
+    if audience != "personal" and courses:
+        lines.append("\n<b>Кому отправляем?</b> Получат только участники выбранного курса.")
+    await message.answer(
+        "\n".join(lines), reply_markup=_send_keyboard(audience, courses)
+    )
 
 
-def _send_keyboard(audience: str) -> InlineKeyboardMarkup:
+def _send_keyboard(audience: str, courses: Sequence[Course]) -> InlineKeyboardMarkup:
+    """Кнопки отправки. Для ответа всем — по кнопке на курс.
+
+    Курс тут обязателен ровно по той же причине, что и у урока: без него
+    аудиторией становится единственная старая группа из настроек, и подписчики
+    второго курса молча выпадают.
+    """
     if audience == "personal":
-        rows = [[InlineKeyboardButton(text="Отправить", callback_data=SEND_ANON)]]
-    else:
+        # Личный ответ адресован тому, кто спросил, и курса не выбирает: право
+        # на ответ даёт членство в любом из его курсов.
+        rows = [[InlineKeyboardButton(text="Отправить", callback_data=f"{SEND_ANON}:0")]]
+    elif courses:
         # Имя спросившего показываем не всегда: одним важно, что вопрос их,
         # другим неловко. Поэтому выбор здесь, а не в общей настройке.
         rows = [
-            [InlineKeyboardButton(text="Отправить с именем", callback_data=SEND_NAMED)],
-            [InlineKeyboardButton(text="Отправить анонимно", callback_data=SEND_ANON)],
+            [
+                InlineKeyboardButton(
+                    text=f"С именем: {course.title}",
+                    callback_data=f"{SEND_NAMED}:{course.id}",
+                )
+            ]
+            for course in courses
+        ]
+        rows += [
+            [
+                InlineKeyboardButton(
+                    text=f"Анонимно: {course.title}",
+                    callback_data=f"{SEND_ANON}:{course.id}",
+                )
+            ]
+            for course in courses
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="Отправить с именем", callback_data=f"{SEND_NAMED}:0")],
+            [InlineKeyboardButton(text="Отправить анонимно", callback_data=f"{SEND_ANON}:0")],
         ]
     rows.append([InlineKeyboardButton(text="Отменить", callback_data=SEND_CANCEL)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -228,7 +263,10 @@ async def _recipients(
     return [question.student] if question is not None else []
 
 
-@router.callback_query(AnswerQuestion.confirming, F.data.in_({SEND_NAMED, SEND_ANON}))
+@router.callback_query(
+    AnswerQuestion.confirming,
+    F.data.startswith(f"{SEND_NAMED}:") | F.data.startswith(f"{SEND_ANON}:"),
+)
 async def send_answer(
     callback: CallbackQuery,
     state: FSMContext,
@@ -250,12 +288,16 @@ async def send_answer(
         await state.clear()
         return
 
+    raw_action, raw_course = str(callback.data).rsplit(":", 1)
+    course_id = int(raw_course) or None
+    course = await get_course(session, course_id) if course_id else None
+
     recipients = await _recipients(session, question.id, data["audience"])
     caption = _compose(
         question,
         body=data.get("caption"),
         audience=data["audience"],
-        with_name=(callback.data == SEND_NAMED),
+        with_name=(raw_action == SEND_NAMED),
     )
 
     lesson = await save_lesson(
@@ -266,6 +308,7 @@ async def send_answer(
         staged=staged,
         max_side=settings.lesson_max_side,
         question_id=question.id,
+        course_id=course.id if course else None,
     )
     Storage.drop_staging(Path(data["staging"]))
     await state.clear()
@@ -274,7 +317,13 @@ async def send_answer(
         await message.answer(f"Ответ сохранён (материал #{lesson.id}), но получателей нет.")
         return
 
-    report = await broadcaster.run(LessonSpec.of(lesson), recipients)
+    # Для личного ответа курса нет: право на него даёт членство в любом курсе.
+    # Иначе допуск свалился бы на единственную группу из настроек, и ученику
+    # второго курса ответить было бы невозможно в принципе.
+    entitle_chats = [item.chat_id for item in await list_courses(session)]
+    report = await broadcaster.run(
+        LessonSpec.of(lesson, entitle_chats=entitle_chats), recipients
+    )
 
     # Отвеченным помечаем только после реальной доставки. Иначе вопрос ученика,
     # который к этому моменту вышел из группы, исчез бы из /questions, хотя
