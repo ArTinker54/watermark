@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ class UidExhaustedError(RuntimeError):
     """Свободные uid кончились — формат метки не вмещает больше учеников."""
 
 
+class UidAssignmentError(RuntimeError):
+    """Номер присвоить не удалось. Ученику об этом надо сказать, а не молчать."""
+
+
 # --- Ученики -------------------------------------------------------------------
 
 
@@ -62,6 +67,14 @@ async def list_active_students(session: AsyncSession) -> Sequence[Student]:
         .order_by(Student.uid)
     )
     return result.scalars().all()
+
+
+#: Присвоение номера сериализуется. ``max(uid) + 1`` без блокировки — учебная
+#: гонка: при всплеске согласий несколько корутин читают одно и то же число, и
+#: все, кроме одной, упираются в чужой коммит. Боты живут одним процессом, так
+#: что обычной блокировки хватает; повторы ниже остаются страховкой на случай,
+#: если процессов когда-нибудь станет больше.
+_uid_lock = asyncio.Lock()
 
 
 async def _next_uid(session: AsyncSession) -> int:
@@ -97,29 +110,35 @@ async def register_student(
         await session.commit()
         return existing
 
-    for attempt in range(_UID_RETRIES):
-        student = Student(
-            tg_user_id=tg_user_id,
-            uid=await _next_uid(session),
-            username=username,
-            full_name=full_name,
-            status=StudentStatus.ACTIVE,
-            consent_at=utcnow(),
-        )
-        session.add(student)
-        try:
-            await session.commit()
-        except IntegrityError:
-            # Гонка одновременных /start: uid или tg_user_id уже заняты.
-            await session.rollback()
-            duplicate = await get_student_by_tg_id(session, tg_user_id)
-            if duplicate is not None:
-                return duplicate
-            logger.warning("конфликт uid, попытка %d", attempt + 1)
-            continue
-        return student
+    async with _uid_lock:
+        for attempt in range(_UID_RETRIES):
+            student = Student(
+                tg_user_id=tg_user_id,
+                uid=await _next_uid(session),
+                username=username,
+                full_name=full_name,
+                status=StudentStatus.ACTIVE,
+                consent_at=utcnow(),
+            )
+            session.add(student)
+            try:
+                await session.commit()
+            except IntegrityError:
+                # Гонка одновременных /start: uid или tg_user_id уже заняты.
+                await session.rollback()
+                duplicate = await get_student_by_tg_id(session, tg_user_id)
+                if duplicate is not None:
+                    return duplicate
+                logger.warning("конфликт uid, попытка %d", attempt + 1)
+                # Небольшая пауза: без неё повторы укладываются в один и тот же
+                # миг и упираются в тот же самый чужой коммит.
+                await asyncio.sleep(0.05 * (attempt + 1))
+                continue
+            return student
 
-    raise RuntimeError("не удалось присвоить uid за отведённое число попыток")
+    raise UidAssignmentError(
+        f"не удалось присвоить номер за {_UID_RETRIES} попыток"
+    )
 
 
 async def set_student_status(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -22,6 +24,8 @@ from aiogram.types import Chat, ChatMemberRestricted, User
 from app.bots.student.handlers import common, registration
 from app.bots.student.handlers.chats import handle_group_id, on_membership_change
 from app.config import Settings
+from app.db import Student, create_database
+from app.db.repo import register_student
 from app.services.membership import (
     CourseUnreachable,
     check_membership,
@@ -264,3 +268,47 @@ async def test_private_chat_is_ignored(caplog: pytest.LogCaptureFixture) -> None
         await on_membership_change(_FakeEvent(chat, "member"))
 
     assert "VSA_GROUP_ID" not in caplog.text
+
+
+async def test_simultaneous_consent_gives_everyone_a_number(tmp_path) -> None:
+    """Всплеск согласий не должен оставлять людей без регистрации.
+
+    Номер выдавался как max(uid)+1 без блокировки: при одновременных нажатиях
+    корутины читали одно и то же число, и все, кроме одной, упирались в чужой
+    коммит. Пять повторов подряд, без паузы, кончались молчанием — человек
+    нажал «Принимаю» и не узнал, записан он или нет.
+
+    Нагрузка выбрана по замеру: на прежнем коде с 50 одновременных согласий
+    начинали теряться люди (на 100 — трое, на 200 — пятеро). Двадцати пяти для
+    воспроизведения не хватало, поэтому здесь именно сотня.
+    """
+    count = 100
+    settings = Settings(
+        admin_bot_token="a:t",
+        student_bot_token="s:t",
+        admin_ids="1",
+        wm_pw_img=1,
+        wm_pw_wm=2,
+        db_path=tmp_path / "race.sqlite3",
+        storage_path=tmp_path / "storage",
+        offer_path=Path("app/texts/offer.txt"),
+    )
+    database = create_database(settings)
+    await database.create_all()
+
+    async def register(tg_id: int) -> Student:
+        async with database.session_factory() as session:
+            return await register_student(
+                session, tg_user_id=tg_id, username=f"u{tg_id}", full_name=f"Ученик {tg_id}"
+            )
+
+    try:
+        students = await asyncio.gather(*(register(7000 + i) for i in range(count)))
+    finally:
+        await database.dispose()
+
+    uids = sorted(student.uid for student in students)
+    assert len(uids) == count, "зарегистрироваться должны все"
+    assert uids == list(range(1, count + 1)), (
+        f"номера обязаны быть уникальными и подряд: {uids}"
+    )

@@ -14,10 +14,17 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.db.repo import get_student_by_tg_id, list_courses, register_student
+from app.db.repo import (
+    UidAssignmentError,
+    UidExhaustedError,
+    get_student_by_tg_id,
+    list_courses,
+    register_student,
+)
 from app.services.membership import in_any_course
 from app.texts import load_offer
 from app.utils import split_html
@@ -107,12 +114,34 @@ async def handle_start(
 @router.callback_query(F.data == CONSENT_CALLBACK)
 async def handle_consent(callback: CallbackQuery, session: AsyncSession) -> None:
     user = callback.from_user
-    student = await register_student(
-        session,
-        tg_user_id=user.id,
-        username=user.username,
-        full_name=user.full_name,
-    )
+    try:
+        student = await register_student(
+            session,
+            tg_user_id=user.id,
+            username=user.username,
+            full_name=user.full_name,
+        )
+    except UidExhaustedError:
+        logger.error("свободные номера кончились: tg_id=%s", user.id)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "Не получилось выдать доступ — закончились свободные номера. "
+                "Напишите администратору курса."
+            )
+        return
+    except (UidAssignmentError, SQLAlchemyError):
+        # Молчание тут — худший исход: человек нажал «Принимаю», ничего не
+        # произошло, и он не знает, зарегистрирован он или нет.
+        logger.exception("регистрация не удалась: tg_id=%s", user.id)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "Не получилось записать вас с первого раза. "
+                "Нажмите «Принимаю» ещё раз — обычно со второй попытки проходит."
+            )
+        return
+
     logger.info(
         "оферта принята: uid=%s tg_id=%s (%s)",
         student.uid_str,
