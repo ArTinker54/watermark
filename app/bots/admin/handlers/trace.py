@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from html import escape as quote
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, StateFilter
@@ -104,6 +105,8 @@ def _format_miss(miss: TraceMiss) -> str:
             "",
         ]
 
+    if miss.payload_raw:
+        lines += [f"Сырое чтение: <code>{quote(miss.payload_raw)}</code>", ""]
     if miss.best_lesson_id is not None:
         lines.append(f"Похоже на урок #{miss.best_lesson_id}")
     lines.append(f"Проверено оригиналов: {miss.checked}")
@@ -148,20 +151,28 @@ def _delivery_note(hit: TraceHit) -> str:
     его) и отсутствие записи вовсе.
     """
     delivery = hit.delivery
-    if delivery is None or delivery.wm_payload != hit.payload.encode():
+    if delivery is None:
+        return (
+            "Записи о такой выдаче в журнале нет — проверьте, "
+            "не пересылался ли материал вручную."
+        )
+    # Статус проверяется раньше метки: у пропуска метка пустая по построению
+    # (копию не создавали), и сравнение строк увело бы этот случай в ветку
+    # «записи нет», хотя запись как раз есть и говорит важное.
+    if delivery.status is DeliveryStatus.SKIPPED:
+        return (
+            "В журнале запись о пропуске: копию для него не создавали. "
+            "Похоже, материал попал к нему не через бота."
+        )
+    if delivery.wm_payload != hit.payload.encode():
         return (
             "Записи о такой выдаче в журнале нет — проверьте, "
             "не пересылался ли материал вручную."
         )
     if delivery.status is DeliveryStatus.SENT:
         return "Выдача подтверждена журналом."
-    if delivery.status is DeliveryStatus.FAILED:
-        return (
-            "В журнале запись об ошибке отправки: копия с этой меткой была "
-            f"сделана именно для него ({format_dt(delivery.delivered_at)}), "
-            "но доставка сорвалась. Метка всё равно его."
-        )
     return (
-        "В журнале запись о пропуске: копию для него не создавали. "
-        "Похоже, материал попал к нему не через бота."
+        "В журнале запись об ошибке отправки: копия с этой меткой была "
+        f"сделана именно для него ({format_dt(delivery.delivered_at)}), "
+        "но доставка сорвалась. Метка всё равно его."
     )

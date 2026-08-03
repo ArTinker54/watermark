@@ -335,6 +335,23 @@ async def get_delivery(
     return result.scalar_one_or_none()
 
 
+async def list_issued_payloads(session: AsyncSession, lesson_id: int) -> list[str]:
+    """Метки, которые по этому уроку правда выдавались.
+
+    Это и есть избыточность, которой нет в самом формате метки: прочитанное из
+    утёкшей картинки сверяется не с регуляркой, а с этим списком. Пропуски не в
+    счёт — там копию не создавали, и метки не существует.
+    """
+    result = await session.execute(
+        select(Delivery.wm_payload).where(
+            Delivery.lesson_id == lesson_id,
+            Delivery.status != DeliveryStatus.SKIPPED,
+            Delivery.wm_payload != "",
+        )
+    )
+    return list(result.scalars().all())
+
+
 # --- Курсы ---------------------------------------------------------------------
 
 
@@ -526,7 +543,9 @@ async def log_trace_attempt(
             image_path=str(image_path),
             success=success,
             confidence=confidence,
-            payload_raw=payload_raw,
+            # Повреждённое чтение — это произвольные байты, а не метка формата:
+            # длину надо обрезать по колонке, иначе запись о неудаче потеряется.
+            payload_raw=payload_raw[:64] if payload_raw else payload_raw,
             lesson_id=lesson_id,
             student_id=student_id,
             note=note,

@@ -26,6 +26,7 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from app.watermark.payload import WM_BIT_LENGTH, Payload
+from app.watermark.verify import SoftRead, kmeans_threshold
 
 # Библиотека печатает рекламный баннер в stdout при первом создании WaterMark().
 bw_notes.close()
@@ -293,6 +294,41 @@ class WatermarkEngine:
             # AssertionError — когда картинка мельче минимального блока.
             logger.debug("извлечение не удалось: %s", exc)
             return None
+
+    def extract_soft(
+        self,
+        image: Path | BgrImage,
+        original_size: tuple[int, int],
+        *,
+        bit_length: int = WM_BIT_LENGTH,
+    ) -> SoftRead | None:
+        """Прочитать метку, не округляя биты.
+
+        Обычное извлечение сразу приводит каждый бит к 0/1 и теряет главное —
+        насколько уверенно он прочитан. Для сверки с выданными копиями нужны
+        именно неокруглённые значения: одиночный сбой видно только по тому, что
+        подозрительный бит стоял вплотную к границе между нулём и единицей.
+        """
+        source = load_bgr(image) if isinstance(image, Path) else image
+        normalized = resize_to(source, original_size)
+
+        bwm = self._new()
+        bwm.wm_size = bit_length
+        try:
+            raw = bwm.bwm_core.extract(img=normalized, wm_shape=bit_length)
+        except (ValueError, AssertionError, IndexError) as exc:
+            logger.debug("мягкое извлечение не удалось: %s", exc)
+            return None
+
+        # extract_decrypt снимает перестановку по паролю и возвращает биты в
+        # исходном порядке — том же, в каком их даёт bits_of.
+        values = tuple(
+            float(value)
+            for value in np.asarray(
+                bwm.extract_decrypt(wm_avg=np.asarray(raw, dtype=float)), dtype=float
+            )
+        )
+        return SoftRead(values=values, threshold=kmeans_threshold(values))
 
 
 # --- Поиск графика на скриншоте ------------------------------------------------

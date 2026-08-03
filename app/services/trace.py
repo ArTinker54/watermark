@@ -1,25 +1,29 @@
 """Трассировка «крысы»: по утёкшей картинке — uid и личность ученика.
 
 Порядок: найти на присланном изображении область урока (template match по
-пристинным оригиналам), выровнять кроп к геометрии оригинала, извлечь метку.
+пристинным оригиналам), выровнять кроп к геометрии оригинала, прочитать метку.
 
-Ключевая деталь — тройная проверка результата. Извлечение из чуть неточного
-кропа умеет возвращать ЧАСТИЧНО верную строку: например ``V|0042|00401`` вместо
-``V|0042|00001``. Формат она проходит, а урок называет чужой. Поэтому одного
-совпадения с регуляркой мало, и результат принимается, только если:
+Ключевая деталь — чем именно проверяется прочитанное. Проверять формат строки
+недостаточно и опасно: в метке ``V|uid|lesson`` нет ни одного избыточного бита,
+поэтому одиночный сбой извлечения даёт другую формально правильную строку — и,
+что хуже всего, чаще всего меняет именно ``uid``, оставляя номер урока верным.
+Сверка урока такие случаи пропускает целиком, а дальше находится реальный
+ученик, у которого в журнале записана ровно эта строка. Итог — уверенное
+обвинение невиновного.
 
-1. строка совпала с форматом метки;
-2. ``lesson_id`` из метки равен id урока, оригинал которого мы нашли на картинке;
-3. ``uid`` принадлежит существующему ученику.
-
-Дополнительно сверяется факт доставки: этому ученику этот урок правда выдавался.
+Поэтому избыточность берётся из журнала: по найденному уроку известно, какие
+именно копии выдавались. Биты не округляются в строку, а сравниваются со всеми
+выданными метками (см. ``app.watermark.verify``). Человек называется, только
+если одна копия совпала точно и заметно оторвалась от остальных; иначе честный
+ответ — «метка повреждена», со списком возможных кандидатов и без имени.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -29,17 +33,24 @@ from app.db.repo import (
     get_delivery,
     get_lesson,
     get_student_by_uid,
+    list_issued_payloads,
     list_lessons,
     log_trace_attempt,
 )
 from app.watermark import (
+    MIN_MARGIN,
     READABLE_SCALE,
     CoarseMatch,
     Payload,
+    SoftRead,
+    Verdict,
     WatermarkEngine,
+    decode,
     load_bgr,
     locate_async,
     locate_coarse_async,
+    match,
+    near_misses,
     rebuild_fragment_async,
 )
 from app.watermark.engine import BgrImage
@@ -97,6 +108,9 @@ class TraceMiss:
     scale: float | None = None
     """Во сколько раз область меньше оригинала. < READABLE_SCALE — безнадёжно."""
 
+    payload_raw: str | None = None
+    """Что прочиталось до сверки. Хранится всегда — это часть доказательной базы."""
+
 
 @dataclass(frozen=True, slots=True)
 class _Attempt:
@@ -107,10 +121,24 @@ class _Attempt:
     found_size: tuple[int, int]
     original_size: tuple[int, int]
     lesson_id: int
+    damaged: str | None = None
+    """Метка прочиталась, но назвать человека нельзя — здесь сказано почему."""
+
+    raw: str | None = None
+    """Сырая строка после округления битов. В журнал попадает всегда."""
 
     @property
     def scale(self) -> float:
         return self.found_size[0] / max(self.original_size[0], 1)
+
+
+@dataclass(frozen=True, slots=True)
+class _Reading:
+    """Результат чтения метки с одной картинки."""
+
+    payload: Payload | None = None
+    raw: str | None = None
+    damaged: str | None = None
 
 
 TraceResult = TraceHit | TraceMiss
@@ -121,6 +149,40 @@ class _Candidate:
     lesson: Lesson
     image: LessonImage
     coarse: CoarseMatch
+
+
+def _damaged_note(read: SoftRead, issued: Sequence[str], verdict: Verdict) -> str:
+    """Объяснение, почему метка есть, а имени не будет.
+
+    Кандидаты показываются намеренно: автору полезно знать круг, но между
+    «вот эти шестеро» и «это он» — принципиальная разница, и стирать её нельзя.
+    """
+    uids = [
+        f"{parsed.uid:04d}"
+        for parsed in (Payload.parse(item) for item in near_misses(read, issued))
+        if parsed is not None
+    ]
+    who = ", ".join(uids) if uids else "сузить не удалось"
+
+    if verdict.mismatched:
+        head = (
+            f"метка повреждена: из {len(issued)} выданных копий ни одна не совпала "
+            f"точно, ближайшая разошлась на {verdict.mismatched} бит"
+        )
+    else:
+        head = (
+            "метка совпала с выданной копией, но соседняя выданная метка почти "
+            f"так же похожа на прочитанное (отрыв {verdict.margin:.2f} при пороге "
+            f"{MIN_MARGIN}) — одного сбитого бита хватило бы, чтобы поменять ответ"
+        )
+    return f"{head}. Назвать участника нельзя. Кандидаты: {who}"
+
+
+def _unknown_student(payload: Payload) -> str:
+    return (
+        f"метка прочитана ({payload.encode()}), но ученика с номером "
+        f"{payload.uid:04d} в базе нет"
+    )
 
 
 class TraceService:
@@ -190,6 +252,22 @@ class TraceService:
                 checked=checked,
             )
 
+        # Если метка вообще прочиталась, но не прошла сверку — это куда более
+        # содержательный ответ, чем «не читается», и он важнее по существу:
+        # автор должен видеть, что след есть, но назвать по нему нельзя.
+        damaged = next((item for item in attempts if item.damaged), None)
+        if damaged is not None:
+            return TraceMiss(
+                reason=damaged.damaged or "",
+                checked=checked,
+                best_confidence=damaged.confidence,
+                best_lesson_id=damaged.lesson_id,
+                found_size=damaged.found_size,
+                original_size=damaged.original_size,
+                scale=damaged.scale,
+                payload_raw=damaged.raw,
+            )
+
         best = max(attempts, key=lambda item: item.confidence)
         # Про «слишком мелко» говорим, только если урок действительно опознан.
         # На слабом совпадении это была бы уверенно названная неверная причина,
@@ -216,6 +294,7 @@ class TraceService:
             found_size=best.found_size,
             original_size=best.original_size,
             scale=best.scale,
+            payload_raw=best.raw,
         )
 
     async def trace_text(self, text: str, *, admin_tg_id: int) -> TraceResult:
@@ -315,6 +394,55 @@ class TraceService:
         found.sort(key=lambda item: item.coarse.confidence, reverse=True)
         return found[: self._max_candidates]
 
+    async def _identify(
+        self, image: BgrImage, size: tuple[int, int], lesson: Lesson
+    ) -> _Reading:
+        """Прочитать метку и сверить её с копиями, выданными по этому уроку.
+
+        Здесь и стоит настоящая защита от одиночного сбоя: вместо разбора
+        округлённой строки прочитанные биты сравниваются со списком выданных
+        меток, и человек называется только при уверенной победе одной из них.
+        """
+        read = await asyncio.to_thread(self._engine.extract_soft, image, size)
+        if read is None:
+            return _Reading()
+
+        raw = decode(read)
+        async with self._session_factory() as session:
+            issued = await list_issued_payloads(session, lesson.id)
+
+        verdict = match(read, issued) if issued else None
+        if verdict is None:
+            # Сверять не с чем: по уроку не выдано ни одной копии (обычно это
+            # означает, что рассылка ещё не проходила). Остаётся старый путь —
+            # округлить биты и разобрать формат. Он слабее, поэтому опирается
+            # хотя бы на совпадение номера урока.
+            payload = Payload.parse(raw) if raw else None
+            if payload is None or payload.lesson_id != lesson.id:
+                return _Reading(raw=raw)
+            logger.info(
+                "урок %d ещё никому не выдавался — метку сверить не с чем", lesson.id
+            )
+            return _Reading(payload=payload, raw=raw)
+
+        if verdict.trustworthy:
+            return _Reading(payload=Payload.parse(verdict.payload), raw=raw)
+
+        if not verdict.plausible:
+            # Прочитанное не похоже на метку вовсе — говорить о повреждении
+            # нечестно. Пусть отказ объяснят по размеру и пережатию.
+            return _Reading(raw=raw)
+
+        logger.info(
+            "метка урока %d прочиталась ненадёжно: расхождений %d, отрыв %.2f, "
+            "шаткий бит %.2f",
+            lesson.id,
+            verdict.mismatched,
+            verdict.margin,
+            verdict.weakest_bit,
+        )
+        return _Reading(raw=raw, damaged=_damaged_note(read, issued, verdict))
+
     async def _try_fragment(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:
         original = Path(candidate.image.path)
         rebuilt = await rebuild_fragment_async(suspect, original, hint=candidate.coarse)
@@ -322,18 +450,17 @@ class TraceService:
             return None
 
         size = candidate.image.size
-        found = (rebuilt.box[2], rebuilt.box[3])
         attempt = _Attempt(
             hit=None,
             confidence=rebuilt.confidence,
-            found_size=found,
+            found_size=(rebuilt.box[2], rebuilt.box[3]),
             original_size=size,
             lesson_id=candidate.lesson.id,
         )
 
-        payload = await asyncio.to_thread(self._engine.extract, rebuilt.image, size)
-        if payload is None or payload.lesson_id != candidate.lesson.id:
-            return attempt
+        reading = await self._identify(rebuilt.image, size, candidate.lesson)
+        if reading.payload is None:
+            return replace(attempt, damaged=reading.damaged, raw=reading.raw)
 
         logger.info(
             "метка собрана из обрезка: урок %d, уцелело %.0f%% площади",
@@ -341,15 +468,11 @@ class TraceService:
             rebuilt.coverage * 100,
         )
         hit = await self._build_hit(
-            candidate, payload, confidence=rebuilt.confidence, box=rebuilt.box
+            candidate, reading.payload, confidence=rebuilt.confidence, box=rebuilt.box
         )
-        return _Attempt(
-            hit=hit,
-            confidence=rebuilt.confidence,
-            found_size=found,
-            original_size=size,
-            lesson_id=candidate.lesson.id,
-        )
+        if hit is None:
+            return replace(attempt, raw=reading.raw, damaged=_unknown_student(reading.payload))
+        return replace(attempt, hit=hit, raw=reading.raw)
 
     async def _build_hit(
         self,
@@ -358,14 +481,20 @@ class TraceService:
         *,
         confidence: float,
         box: tuple[int, int, int, int],
-    ) -> TraceHit:
+    ) -> TraceHit | None:
+        """Собрать вердикт. ``None`` — метка указывает на несуществующего ученика.
+
+        Такого быть не должно: метка пришла из списка выданных, а значит ученик
+        есть. Но если запись о нём удалили, назвать всё равно некого, и молча
+        отдавать вердикт без имени нельзя.
+        """
         async with self._session_factory() as session:
             student = await get_student_by_uid(session, payload.uid)
-            delivery = None
-            if student is not None:
-                delivery = await get_delivery(
-                    session, lesson_id=candidate.lesson.id, student_id=student.id
-                )
+            if student is None:
+                return None
+            delivery = await get_delivery(
+                session, lesson_id=candidate.lesson.id, student_id=student.id
+            )
 
         return TraceHit(
             payload=payload,
@@ -378,45 +507,36 @@ class TraceService:
 
     async def _try_candidate(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:
         original = Path(candidate.image.path)
-        match = await locate_async(suspect, original, hint=candidate.coarse)
-        if match is None:
+        found = await locate_async(suspect, original, hint=candidate.coarse)
+        if found is None:
             return None
 
         size = candidate.image.size
         attempt = _Attempt(
             hit=None,
-            confidence=match.confidence,
-            found_size=(match.box[2], match.box[3]),
+            confidence=found.confidence,
+            found_size=(found.box[2], found.box[3]),
             original_size=size,
             lesson_id=candidate.lesson.id,
         )
 
-        payload = await asyncio.to_thread(self._engine.extract, match.crop, size)
-        if payload is None:
+        reading = await self._identify(found.crop, size, candidate.lesson)
+        if reading.payload is None:
             # Запасной заход: утечка могла быть не скриншотом, а самим файлом,
             # который просто пережали — тогда кроп не нужен вовсе.
-            payload = await asyncio.to_thread(self._engine.extract, suspect, size)
-        if payload is None:
-            return attempt
+            whole = await self._identify(suspect, size, candidate.lesson)
+            if whole.payload is not None or reading.raw is None:
+                reading = whole
 
-        if payload.lesson_id != candidate.lesson.id:
-            logger.info(
-                "метка прочиталась частично: урок %d, а в метке %d — отбрасываем",
-                candidate.lesson.id,
-                payload.lesson_id,
-            )
-            return attempt
+        if reading.payload is None:
+            return replace(attempt, damaged=reading.damaged, raw=reading.raw)
 
         hit = await self._build_hit(
-            candidate, payload, confidence=match.confidence, box=match.box
+            candidate, reading.payload, confidence=found.confidence, box=found.box
         )
-        return _Attempt(
-            hit=hit,
-            confidence=match.confidence,
-            found_size=attempt.found_size,
-            original_size=size,
-            lesson_id=candidate.lesson.id,
-        )
+        if hit is None:
+            return replace(attempt, raw=reading.raw, damaged=_unknown_student(reading.payload))
+        return replace(attempt, hit=hit, raw=reading.raw)
 
     async def _log(self, admin_tg_id: int, image_path: Path, result: TraceResult) -> None:
         async with self._session_factory() as session:
@@ -439,6 +559,7 @@ class TraceService:
                     image_path=image_path,
                     success=False,
                     confidence=result.best_confidence,
+                    payload_raw=result.payload_raw,
                     lesson_id=result.best_lesson_id,
                     note=result.reason[:500],
                 )
