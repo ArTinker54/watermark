@@ -10,10 +10,12 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.db import DeliveryStatus
+from app.db import DeliveryStatus, Student
 from app.db.repo import (
+    get_course,
     get_lesson,
     list_active_students,
+    list_courses,
     list_lesson_deliveries,
     list_lesson_summaries,
 )
@@ -37,41 +39,127 @@ async def show_recipients(
     settings: Settings,
     broadcaster: LessonBroadcaster,
 ) -> None:
-    """Сколько человек получит материал прямо сейчас.
+    """Кто что получит, в разбивке по курсам.
 
-    Число живое: членство в группе проверяется запросами к Telegram, а не
-    берётся из базы. Именно оно определяет, кому уйдёт следующий урок.
+    Числа живые: членство спрашивается у Telegram, а не берётся из базы.
+    Именно они определяют, кому уйдёт следующий материал каждого курса.
     """
     students = list(await list_active_students(session))
     if not students:
         await message.answer("Ни один ученик ещё не принял условия.")
         return
 
+    courses = list(await list_courses(session))
+    if not courses:
+        await _without_courses(message, settings, broadcaster, students)
+        return
+
+    status = await message.answer(
+        f"Проверяю {len(students)} учеников по {len(courses)} курсам…"
+    )
+
+    inside: dict[int, set[int]] = {}
+    for course in courses:
+        members, _ = await broadcaster.split_by_membership(students, chat_id=course.chat_id)
+        inside[course.id] = {student.id for student in members}
+
+    lines = ["<b>Получатели по курсам</b>", f"Принято условий: {len(students)}", ""]
+    for course in courses:
+        lines.append(f"<b>{course.title}</b> — получат {len(inside[course.id])}")
+
+    # Сколько курсов приходится на человека: это и есть ответ на вопрос,
+    # кто получит два потока, кто один, а кто уже ничего.
+    counts = {
+        student.id: sum(1 for course in courses if student.id in inside[course.id])
+        for student in students
+    }
+    if len(courses) > 1:
+        both = sum(1 for value in counts.values() if value > 1)
+        lines.append(f"\nСразу в нескольких курсах: {both}")
+
+    orphans = [student for student in students if counts[student.id] == 0]
+    if orphans:
+        lines.append(f"\n<b>Ни в одном курсе ({len(orphans)}):</b>")
+        lines.append("Зарегистрированы, но материалы им больше не уходят.")
+        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in orphans[:_NAMES])
+        if len(orphans) > _NAMES:
+            lines.append(f"…и ещё {len(orphans) - _NAMES}")
+
+    if not any(inside.values()) and len(students) > 1:
+        lines.append(
+            "\n⚠️ Не прошёл никто ни по одному курсу. Похоже на сбой настройки: "
+            "проверьте, что бот рассылки — администратор во всех чатах курсов."
+        )
+    await status.edit_text("\n".join(lines))
+
+
+async def _without_courses(
+    message: Message,
+    settings: Settings,
+    broadcaster: LessonBroadcaster,
+    students: list[Student],
+) -> None:
+    """Курсов не заведено — старое поведение по одной группе из настроек."""
     if settings.vsa_group_id is None:
         await message.answer(
             f"<b>Получателей: {len(students)}</b>\n\n"
-            "Проверка членства в группе выключена — материалы получат все, "
-            "кто принял условия."
+            "Курсы не заведены и проверка членства выключена — материалы "
+            "получат все, кто принял условия.\n\nЗавести курс: /courses"
         )
         return
 
     status = await message.answer(f"Проверяю {len(students)} учеников…")
     inside, outside = await broadcaster.split_by_membership(students)
+    lines = [f"<b>Получателей: {len(inside)}</b>", f"Принято условий: {len(students)}"]
+    if outside:
+        lines.append(f"\n<b>Не получат — нет в группе ({len(outside)}):</b>")
+        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in outside[:_NAMES])
+    await status.edit_text("\n".join(lines))
+
+
+@router.message(Command("course"))
+async def show_course_audience(
+    message: Message,
+    command: CommandObject,
+    session: AsyncSession,
+    broadcaster: LessonBroadcaster,
+) -> None:
+    """Поимённо: кто из зарегистрированных состоит в этом курсе."""
+    raw = (command.args or "").strip().lstrip("#")
+    if not raw.isdigit():
+        courses = list(await list_courses(session, only_active=False))
+        hint = "\n".join(f"• <code>/course {c.id}</code> — {c.title}" for c in courses)
+        await message.answer(f"Укажите номер курса:\n{hint}" if hint else "Курсов нет.")
+        return
+
+    course = await get_course(session, int(raw))
+    if course is None:
+        await message.answer(f"Курса #{raw} нет. Список: /courses")
+        return
+
+    students = list(await list_active_students(session))
+    if not students:
+        await message.answer("Ни один ученик ещё не принял условия.")
+        return
+
+    status = await message.answer(f"Проверяю {len(students)} учеников…")
+    inside, outside = await broadcaster.split_by_membership(students, chat_id=course.chat_id)
 
     lines = [
-        f"<b>Получателей: {len(inside)}</b>",
-        f"Принято условий: {len(students)}",
+        f"<b>{course.title}</b>",
+        f"Получат материалы курса: <b>{len(inside)}</b> из {len(students)}",
+        "",
     ]
+    if inside:
+        lines.append(f"<b>В курсе ({len(inside)}):</b>")
+        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in inside[:_NAMES])
+        if len(inside) > _NAMES:
+            lines.append(f"…и ещё {len(inside) - _NAMES}")
     if outside:
-        lines.append(f"\n<b>Не получат — нет в группе курса ({len(outside)}):</b>")
+        lines.append(f"\n<b>Не в курсе ({len(outside)}):</b>")
         lines.extend(f"• {s.uid_str} — {s.display_name}" for s in outside[:_NAMES])
         if len(outside) > _NAMES:
             lines.append(f"…и ещё {len(outside) - _NAMES}")
-    if outside and not inside and len(students) > 1:
-        lines.append(
-            "\n⚠️ Не прошёл никто. Похоже на сбой настройки: проверьте, "
-            "что бот раздачи всё ещё администратор группы."
-        )
     await status.edit_text("\n".join(lines))
 
 
@@ -90,8 +178,9 @@ async def show_lessons(message: Message, session: AsyncSession) -> None:
             counts.append(f"пропущено {item.skipped}")
         if item.failed:
             counts.append(f"ошибок {item.failed}")
-        lines.append(f"<b>{item.lesson.title}</b> · {format_dt(item.lesson.created_at)}")
-        lines.append("   " + " · ".join(counts))
+        course = item.lesson.course.title if item.lesson.course else "всем"
+        lines.append(f"<b>{item.lesson.title}</b> · {course}")
+        lines.append(f"   {format_dt(item.lesson.created_at)} · " + " · ".join(counts))
     lines.append("\nПодробности: /lesson &lt;номер&gt;")
     await message.answer("\n".join(lines))
 
@@ -122,6 +211,7 @@ async def show_lesson(message: Message, command: CommandObject, session: AsyncSe
 
     lines = [
         f"<b>{lesson.title}</b> · {format_dt(lesson.created_at)}",
+        f"Курс: {lesson.course.title if lesson.course else 'всем зарегистрированным'}",
         f"Получили: <b>{len(groups[DeliveryStatus.SENT])}</b>",
     ]
     titles = {
