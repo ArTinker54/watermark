@@ -51,6 +51,8 @@ from app.services import (
 )
 from app.services.lessons import save_lesson
 from app.watermark import READABLE_SCALE, Payload, WatermarkEngine, embed_async
+from app.watermark.text import extract as extract_text
+from app.watermark.text import strip_marks
 from tests.conftest import (
     PW_IMG,
     PW_WM,
@@ -1052,6 +1054,134 @@ async def test_split_keeps_student_when_check_breaks(
 
     assert [s.uid for s in kept] == [student.uid]
     assert dropped == []
+
+
+LONG_CAPTION = (
+    "Разбор ситуации по газу. Первое: уровень 2.81 держится третий день, каждый "
+    "подход к нему сопровождается ростом объёма, но цена не идёт выше. Второе: "
+    "спред на последних барах сузился, продавец разгружается в покупателя. "
+    "Третье: если завтра увидим тест сверху на низком объёме, это подтверждение. "
+    "Вход только после подтверждения, стоп ставим строго за уровень."
+)
+
+
+async def test_text_is_marked_per_student(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Каждому уходит свой текст: на вид одинаковый, по символам разный."""
+    alice = await _register(database, 9920, "Алиса")
+    bob = await _register(database, 9921, "Борис")
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=LONG_CAPTION,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_text")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    texts = {
+        item.chat_id: (item.caption or item.text or "")
+        for item in bot.sent
+        if item.caption or item.text
+    }
+    first, second = texts[alice.tg_user_id], texts[bob.tg_user_id]
+
+    assert first != second, "текст обязан быть персональным"
+    assert strip_marks(first) == strip_marks(second) == LONG_CAPTION, "на вид одинаковы"
+    assert extract_text(first) == Payload(uid=alice.uid, lesson_id=lesson.id)
+    assert extract_text(second) == Payload(uid=bob.uid, lesson_id=lesson.id)
+
+
+async def test_short_caption_goes_unmarked_not_broken(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Короткую подпись метка не вмещает — она должна уйти как есть."""
+    student = await _register(database, 9922, "Алиса")
+    short = "Смотри на объём"
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=short,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_short")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    assert report.sent == 1
+    delivered = next(item for item in bot.sent if item.chat_id == student.tg_user_id)
+    assert delivered.caption == short, "подпись не должна пострадать"
+    assert not LessonSpec.of(lesson).text_can_be_marked
+
+
+async def test_leaked_text_identifies_the_student(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Скопированный текст урока должен назвать конкретного ученика."""
+    student = await _register(database, 9923, "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=LONG_CAPTION,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_leak_text")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+    leaked = next(item.caption for item in bot.sent if item.chat_id == student.tg_user_id)
+    assert leaked is not None
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    # Пират вставил текст в свой чат, добавив что-то от себя.
+    result = await tracer.trace_text(f"Смотрите что скинули:\n\n{leaked}", admin_tg_id=1)
+
+    assert isinstance(result, TraceHit), getattr(result, "reason", result)
+    assert result.payload == Payload(uid=student.uid, lesson_id=lesson.id)
+    assert result.student is not None and result.student.tg_user_id == student.tg_user_id
+    assert result.source == "текст"
+    assert result.delivery_confirmed
+
+
+async def test_retyped_text_is_not_attributed(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Перепечатанный текст не должен назначать виноватого."""
+    await _register(database, 9924, "Алиса")
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace_text(LONG_CAPTION, admin_tg_id=1)
+
+    assert isinstance(result, TraceMiss)
+    assert "метки нет" in result.reason
 
 
 async def test_unrelated_image_is_not_attributed(

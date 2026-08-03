@@ -27,6 +27,8 @@ from app.db.repo import record_delivery, set_student_status
 from app.services.membership import is_group_member
 from app.services.storage import Storage
 from app.watermark import Payload, WatermarkEngine, WatermarkError, embed_async
+from app.watermark.text import embed as text_embed
+from app.watermark.text import fits as text_fits
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,11 @@ class LessonSpec:
             caption=lesson.caption,
             images=tuple(Path(image.path) for image in lesson.images),
         )
+
+    @property
+    def text_can_be_marked(self) -> bool:
+        """Хватает ли текста, чтобы вшить в него метку. См. app.watermark.text."""
+        return bool(self.caption) and text_fits(self.caption or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,8 +309,15 @@ class LessonBroadcaster:
         except (WatermarkError, OSError, ValueError) as exc:
             return await self._fail(lesson, student, payload, f"метка не встроена: {exc}")
 
+        # Текст помечается персонально так же, как картинка: невидимыми
+        # символами между словами. Короткая подпись метку не вмещает — тогда
+        # уходит как есть, а автор видит это в отчёте.
+        caption = lesson.caption
+        if caption:
+            caption = text_embed(caption, payload) or caption
+
         try:
-            message_id = await self._send(student.tg_user_id, lesson.caption, marked)
+            message_id = await self._send(student.tg_user_id, caption, marked)
         except TelegramForbiddenError:
             await self._block(student)
             return await self._fail(lesson, student, payload, "ученик заблокировал бота")

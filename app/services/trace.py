@@ -25,7 +25,13 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import Delivery, DeliveryStatus, Lesson, LessonImage, Student
-from app.db.repo import get_delivery, get_student_by_uid, list_lessons, log_trace_attempt
+from app.db.repo import (
+    get_delivery,
+    get_lesson,
+    get_student_by_uid,
+    list_lessons,
+    log_trace_attempt,
+)
 from app.watermark import (
     READABLE_SCALE,
     CoarseMatch,
@@ -37,6 +43,8 @@ from app.watermark import (
     rebuild_fragment_async,
 )
 from app.watermark.engine import BgrImage
+from app.watermark.text import MIN_GAPS as TEXT_MIN_WORDS
+from app.watermark.text import extract as extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +60,11 @@ class TraceHit:
     payload: Payload
     lesson: Lesson
     student: Student | None
-    confidence: float
-    box: tuple[int, int, int, int]
+    confidence: float | None
+    box: tuple[int, int, int, int] | None
     delivery: Delivery | None
+    source: str = "картинка"
+    """Откуда прочитана метка: из картинки или из текста."""
     """Запись журнала об этой выдаче, если она есть."""
 
     @property
@@ -207,6 +217,56 @@ class TraceService:
             original_size=best.original_size,
             scale=best.scale,
         )
+
+    async def trace_text(self, text: str, *, admin_tg_id: int) -> TraceResult:
+        """Опознать по присланному тексту.
+
+        Отдельный путь от картинки: тут нечего искать и выравнивать — метка
+        либо есть в символах, либо её там нет.
+        """
+        payload = extract_text(text)
+        if payload is None:
+            result: TraceResult = TraceMiss(
+                reason=(
+                    "в тексте метки нет. Она вшивается только в подписи от "
+                    f"{TEXT_MIN_WORDS} слов и не переживает перепечатку или скриншот"
+                ),
+                checked=0,
+            )
+            await self._log(admin_tg_id, Path("(текст)"), result)
+            return result
+
+        async with self._session_factory() as session:
+            lesson = await get_lesson(session, payload.lesson_id)
+            student = await get_student_by_uid(session, payload.uid)
+            delivery = None
+            if lesson is not None and student is not None:
+                delivery = await get_delivery(
+                    session, lesson_id=lesson.id, student_id=student.id
+                )
+
+        if lesson is None:
+            result = TraceMiss(
+                reason=(
+                    f"метка прочитана ({payload.encode()}), но материала "
+                    f"#{payload.lesson_id} в базе нет"
+                ),
+                checked=0,
+            )
+            await self._log(admin_tg_id, Path("(текст)"), result)
+            return result
+
+        hit = TraceHit(
+            payload=payload,
+            lesson=lesson,
+            student=student,
+            confidence=None,
+            box=None,
+            delivery=delivery,
+            source="текст",
+        )
+        await self._log(admin_tg_id, Path("(текст)"), hit)
+        return hit
 
     async def _rank(
         self, suspect: BgrImage, pairs: list[tuple[Lesson, LessonImage]]

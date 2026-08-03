@@ -25,6 +25,8 @@ from app.db.repo import list_active_students
 from app.services import LessonBroadcaster, LessonSpec, Storage, save_lesson
 from app.utils import CAPTION_LIMIT, split_text
 from app.watermark import image_size
+from app.watermark.text import MIN_GAPS
+from app.watermark.text import fits as text_fits
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,11 @@ async def finish_collecting(
             "иначе метка не читается со скриншота чата."
         )
     lines.append("\nКаждый получит свою копию с личной меткой.")
+    if caption:
+        lines.append(
+            "Текст тоже будет помечен." if text_fits(caption)
+            else f"Текст останется без метки: в нём меньше {MIN_GAPS + 1} слов."
+        )
 
     await message.answer("\n".join(lines), reply_markup=_confirm_keyboard(len(students)))
 

@@ -15,6 +15,7 @@ from app.db import DeliveryStatus
 from app.services import Storage, TraceHit, TraceMiss, TraceResult, TraceService
 from app.utils import format_dt
 from app.watermark import READABLE_SCALE
+from app.watermark.text import has_marks
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,34 @@ class Trace(StatesGroup):
 async def start_trace(message: Message, state: FSMContext) -> None:
     await state.set_state(Trace.waiting)
     await message.answer(
-        "Пришлите утёкшую картинку или скриншот экрана.\n\n"
+        "Пришлите утёкшую картинку, скриншот экрана <b>или скопированный текст</b>.\n\n"
         "Скриншот целиком — это нормально: область урока найдётся сама. "
         "Если есть исходный файл, лучше слать <b>файлом</b>: без пережатия "
-        "метка читается увереннее."
+        "метка читается увереннее.\n\n"
+        "Текст должен быть именно скопирован, а не перепечатан: метка в нём "
+        "живёт в невидимых символах."
     )
+
+
+@router.message(StateFilter(Trace.waiting, None), F.text, ~F.text.startswith("/"))
+async def run_text_trace(
+    message: Message, state: FSMContext, tracer: TraceService
+) -> None:
+    """Опознать по присланному тексту.
+
+    Реагируем только если в тексте вправду есть невидимые символы, иначе бот
+    отвечал бы на каждую заметку автора самому себе.
+    """
+    text = message.text or ""
+    if not has_marks(text) and await state.get_state() is None:
+        return
+
+    if message.from_user is None:
+        return
+    await state.clear()
+    status = await message.answer("Ищу метку в тексте…")
+    result = await tracer.trace_text(text, admin_tg_id=message.from_user.id)
+    await status.edit_text(_format(result))
 
 
 @router.message(StateFilter(Trace.waiting, None), F.photo | F.document)
@@ -87,7 +111,6 @@ def _format_miss(miss: TraceMiss) -> str:
 
 
 def _format_hit(hit: TraceHit) -> str:
-    x, y, width, height = hit.box
     lines = [
         "<b>Метка найдена</b>",
         "",
@@ -105,12 +128,13 @@ def _format_hit(hit: TraceHit) -> str:
             "(запись удалена?)"
         )
 
-    lines += [
-        "",
-        f"Метка: <code>{hit.payload.encode()}</code>",
-        f"Совпадение с оригиналом: {hit.confidence:.0%}",
-        f"Область на картинке: {width}×{height} в точке ({x}, {y})",
-    ]
+    lines += ["", f"Метка: <code>{hit.payload.encode()}</code>", f"Источник: {hit.source}"]
+    if hit.confidence is not None and hit.box is not None:
+        x, y, width, height = hit.box
+        lines += [
+            f"Совпадение с оригиналом: {hit.confidence:.0%}",
+            f"Область на картинке: {width}×{height} в точке ({x}, {y})",
+        ]
 
     lines.append(_delivery_note(hit))
     return "\n".join(lines)
