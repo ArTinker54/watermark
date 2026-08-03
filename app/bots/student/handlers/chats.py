@@ -43,6 +43,22 @@ def _may_ask_group_id(message: Message, settings: Settings) -> bool:
     return user is not None and user.id in settings.admin_id_set
 
 
+@router.channel_post(Command("groupid"))
+async def handle_channel_id(message: Message, settings: Settings) -> None:
+    """То же для каналов.
+
+    В канале сообщения приходят другим типом апдейта, а отправителя у них нет
+    вовсе — пишет сам канал. Поэтому проверять некого: команду там может дать
+    только тот, у кого есть право публикации.
+    """
+    await message.reply(
+        f"<code>VSA_GROUP_ID={message.chat.id}</code>\n\n"
+        "Добавить курсом: <code>/addcourse "
+        f"{message.chat.id} НАЗВАНИЕ</code> в боте автора."
+    )
+    logger.info("запрошен id канала «%s»: %s", message.chat.title, message.chat.id)
+
+
 @router.message(Command("groupid"), F.chat.type.in_(_GROUP_TYPES))
 async def handle_group_id(message: Message, settings: Settings) -> None:
     """Показать id чата. Только администратору — остальным бот в группе молчит.
@@ -54,10 +70,12 @@ async def handle_group_id(message: Message, settings: Settings) -> None:
         return
 
     await message.reply(
-        f"<code>VSA_GROUP_ID={message.chat.id}</code>\n\n"
-        "Это можно удалить — значение уже записано в журнал бота."
+        f"<code>{message.chat.id}</code>\n\n"
+        f"Добавить курсом: <code>/addcourse {message.chat.id} НАЗВАНИЕ</code> "
+        "в боте автора.\n"
+        "Это сообщение можно удалить — значение уже в журнале бота."
     )
-    logger.info("запрошен id чата «%s»: VSA_GROUP_ID=%s", message.chat.title, message.chat.id)
+    logger.info("запрошен id чата «%s»: %s", message.chat.title, message.chat.id)
 
 
 @router.my_chat_member()

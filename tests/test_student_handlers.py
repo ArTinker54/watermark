@@ -109,7 +109,8 @@ async def test_groupid_answers_the_author() -> None:
     chat = Chat(id=-1001234567890, type="supergroup", title="VSA PRO")
     message = _FakeGroupMessage(chat, user_id=987)
     await handle_group_id(message, _settings("987"))
-    assert "VSA_GROUP_ID=-1001234567890" in message.replies[0]
+    assert "-1001234567890" in message.replies[0]
+    assert "/addcourse" in message.replies[0]
 
 
 async def test_groupid_ignores_everyone_else() -> None:
@@ -129,7 +130,8 @@ async def test_groupid_answers_anonymous_admin() -> None:
     chat = Chat(id=-1001234567890, type="supergroup", title="VSA PRO")
     message = _FakeGroupMessage(chat, user_id=1087968824, sender_chat=chat)
     await handle_group_id(message, _settings("987"))
-    assert "VSA_GROUP_ID=-1001234567890" in message.replies[0]
+    assert "-1001234567890" in message.replies[0]
+    assert "/addcourse" in message.replies[0]
 
 
 async def test_groupid_ignores_linked_channel() -> None:

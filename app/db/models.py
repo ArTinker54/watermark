@@ -134,6 +134,26 @@ class Question(Base):
         return "(без текста, только картинка)"
 
 
+class Course(Base):
+    """Курс: группа или канал, членство в котором даёт доступ к материалам.
+
+    Курсов может быть несколько. Ученик получает материалы тех, где он состоит:
+    подписан на два — придут оба потока, вышел из одного — останется второй.
+    Состав аудитории ведёт Telegram, а не мы, поэтому доступ всегда актуален.
+    """
+
+    __tablename__ = "courses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(128))
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    def __str__(self) -> str:  # pragma: no cover - для логов
+        return f"{self.title} ({self.chat_id})"
+
+
 class UploadedVideo(Base):
     """Видео, загруженное автором в student-бота и готовое к рассылке.
 
@@ -196,6 +216,14 @@ class Lesson(Base):
 
     video_kind: Mapped[str | None] = mapped_column(String(16), default=None)
     """``video`` или ``document`` — каким способом видео отправлять."""
+
+    course_id: Mapped[int | None] = mapped_column(
+        ForeignKey("courses.id", ondelete="SET NULL"), default=None, index=True
+    )
+    """Кому предназначен материал. NULL — всем зарегистрированным (так вели
+    себя все уроки до появления курсов, и старые записи это сохраняют)."""
+
+    course: Mapped[Course | None] = relationship(lazy="selectin")
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

@@ -17,8 +17,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.db.repo import get_student_by_tg_id, register_student
-from app.services.membership import check_membership
+from app.db.repo import get_student_by_tg_id, list_courses, register_student
+from app.services.membership import in_any_course
 from app.texts import load_offer
 from app.utils import split_text
 
@@ -76,17 +76,23 @@ async def handle_start(
         await message.answer(_welcome(student.uid_str))
         return
 
-    if settings.vsa_group_id is not None:
-        member = await check_membership(bot, settings.vsa_group_id, user.id)
+    # Курсов может быть несколько: доступ даёт членство в любом из них, а какие
+    # именно материалы придут — решается уже при рассылке.
+    courses = await list_courses(session)
+    chat_ids = [course.chat_id for course in courses]
+    if not chat_ids and settings.vsa_group_id is not None:
+        chat_ids = [settings.vsa_group_id]
+
+    if chat_ids:
+        member = await in_any_course(bot, chat_ids, user.id)
         if member is None:
             await message.answer(
-                "Не удалось проверить ваше участие в группе. "
-                "Напишите администратору курса."
+                "Не удалось проверить ваше участие. Напишите администратору курса."
             )
             return
         if not member:
             await message.answer(
-                "Доступ к материалам выдаётся только участникам группы курса. "
+                "Доступ к материалам выдаётся только участникам курса. "
                 "Если вы уже оплатили участие — напишите администратору."
             )
             return

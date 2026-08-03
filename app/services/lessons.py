@@ -50,6 +50,7 @@ async def save_lesson(
     question_id: int | None = None,
     video_file_id: str | None = None,
     video_kind: str | None = None,
+    course_id: int | None = None,
 ) -> Lesson:
     """Превратить черновик в урок.
 
@@ -79,6 +80,7 @@ async def save_lesson(
         question_id=question_id,
         video_file_id=video_file_id,
         video_kind=video_kind,
+        course_id=course_id,
     )
     sizes = ", ".join(f"{image.width}x{image.height}" for image in lesson.images)
     logger.info(

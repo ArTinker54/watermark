@@ -15,7 +15,7 @@ import asyncio
 import logging
 
 from app.bots.admin.setup import build_admin
-from app.bots.runtime import make_bot, run_bots
+from app.bots.runtime import make_bot, migrate_group_to_course, run_bots
 from app.bots.student.setup import build_student
 from app.config import get_settings
 from app.db import create_database
@@ -35,6 +35,7 @@ async def main() -> None:
 
     database = create_database(settings)
     await database.create_all()
+    await migrate_group_to_course(database, settings)
 
     # По одному объекту Bot на токен: student-бот и принимает /start, и
     # рассылает уроки; admin-бот и общается с автором, и шлёт ему уведомления

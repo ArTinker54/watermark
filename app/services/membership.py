@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -54,6 +55,24 @@ async def is_group_member(bot: Bot, group_id: int, user_id: int) -> bool:
             return False
         raise
     return counts_as_member(member)
+
+
+async def in_any_course(bot: Bot, chat_ids: Sequence[int], user_id: int) -> bool | None:
+    """Состоит ли человек хотя бы в одном из курсов.
+
+    ``None`` — ни один курс проверить не удалось. Если хотя бы один ответил
+    «нет», а остальные сломались, это всё равно ``None``: утверждать «его нигде
+    нет» на основании части ответов неправильно.
+    """
+    seen_answer = False
+    for chat_id in chat_ids:
+        try:
+            if await is_group_member(bot, chat_id, user_id):
+                return True
+            seen_answer = True
+        except TelegramAPIError as exc:
+            logger.error("курс %s не проверен: %s", chat_id, exc)
+    return False if seen_answer else None
 
 
 async def check_membership(bot: Bot, group_id: int, user_id: int) -> bool | None:

@@ -18,7 +18,9 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.types import BotCommand
 
+from app.config import Settings
 from app.db import Database
+from app.db.repo import ensure_default_course
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,19 @@ async def _prepare(runtime: BotRuntime) -> None:
     logger.info("%s запущен: @%s", runtime.name, me.username)
     if runtime.commands:
         await runtime.bot.set_my_commands(runtime.commands)
+
+
+async def migrate_group_to_course(database: Database, settings: Settings) -> None:
+    """Перенести единственную группу из настроек в курсы.
+
+    До появления курсов группа была одна и жила в ``VSA_GROUP_ID``. Чтобы
+    обновление не потребовало ручных действий, она заводится курсом сама — но
+    только если курсов ещё нет вовсе.
+    """
+    if settings.vsa_group_id is None:
+        return
+    async with database.session_factory() as session:
+        await ensure_default_course(session, settings.vsa_group_id, "Курс")
 
 
 async def run_bots(runtimes: Sequence[BotRuntime], database: Database) -> None:

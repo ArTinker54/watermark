@@ -28,17 +28,21 @@ from app.config import Settings
 from app.db import DeliveryStatus, QuestionStatus, Student, create_database
 from app.db.repo import (
     MAX_OPEN_QUESTIONS,
+    add_course,
     collect_stats,
     count_open_questions,
     create_question,
+    ensure_default_course,
     get_delivery,
     list_active_students,
+    list_courses,
     list_lesson_summaries,
     list_open_questions,
     mark_video_used,
     record_delivery,
     register_student,
     save_uploaded_video,
+    set_course_active,
     set_question_status,
     take_unused_video,
 )
@@ -667,7 +671,7 @@ class _MembershipBot(FakeBot):
         return SimpleNamespace(status="member")
 
 
-def _gated_broadcaster(bot: FakeBot, engine, storage, database, settings, group_id: int):
+def _gated_broadcaster(bot: FakeBot, engine, storage, database, settings, group_id: int | None):
     return LessonBroadcaster(
         bot=bot,  # type: ignore[arg-type]
         engine=engine,
@@ -1466,6 +1470,118 @@ async def test_used_video_is_not_reattached(database) -> None:
             duration=None,
         )
         assert await take_unused_video(session, 999) is None
+
+
+class _CoursesBot(FakeBot):
+    """Заглушка с несколькими курсами: кто где состоит, задаётся картой."""
+
+    def __init__(self, outbox: Path, membership: dict[int, set[int]]) -> None:
+        super().__init__(outbox=outbox)
+        self.membership = membership
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> Any:
+        if user_id not in self.membership.get(chat_id, set()):
+            raise TelegramBadRequest(method=Mock(), message="Bad Request: PARTICIPANT_ID_INVALID")
+        return SimpleNamespace(status="member")
+
+
+async def test_each_course_reaches_only_its_own_audience(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Материал курса получают только его участники.
+
+    Подписан на два — придут оба потока, на один — только его.
+    """
+    both = await _register(database, 9950, "Оба")
+    first_only = await _register(database, 9951, "Только первый")
+    second_only = await _register(database, 9952, "Только второй")
+
+    async with database.session_factory() as session:
+        pro = await add_course(session, title="Чат VSA PRO", chat_id=-1001)
+        method = await add_course(session, title="Метод VSA", chat_id=-1002)
+        students = list(await list_active_students(session))
+        lessons = {}
+        for course in (pro, method):
+            lessons[course.id] = await save_lesson(
+                session,
+                storage,
+                admin_tg_id=1,
+                caption=None,
+                staged=[lesson_source],
+                max_side=settings.lesson_max_side,
+                course_id=course.id,
+            )
+
+    membership = {
+        -1001: {both.tg_user_id, first_only.tg_user_id},
+        -1002: {both.tg_user_id, second_only.tg_user_id},
+    }
+
+    got: dict[int, set[int]] = {}
+    for course_id, lesson in lessons.items():
+        bot = _CoursesBot(settings.storage_path / f"out_{course_id}", membership)
+        report = await _gated_broadcaster(
+            bot, engine, storage, database, settings, group_id=None
+        ).run(LessonSpec.of(lesson), students)
+        got[course_id] = {
+            item.chat_id for item in bot.sent if item.path or item.text or item.caption
+        }
+        assert report.sent == 2
+
+    pro_id, method_id = list(lessons)
+    assert got[pro_id] == {both.tg_user_id, first_only.tg_user_id}
+    assert got[method_id] == {both.tg_user_id, second_only.tg_user_id}
+    # Подписанный на оба получил из обоих потоков.
+    assert both.tg_user_id in got[pro_id] and both.tg_user_id in got[method_id]
+
+
+async def test_lesson_without_course_goes_to_everyone(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Старые уроки без курса ведут себя как раньше — уходят всем."""
+    await _register(database, 9953, "Первый")
+    await _register(database, 9954, "Второй")
+    async with database.session_factory() as session:
+        await add_course(session, title="Курс", chat_id=-1001)
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    assert LessonSpec.of(lesson).course_chat_id is None
+
+    bot = _CoursesBot(settings.storage_path / "out_nocourse", {})
+    report = await _gated_broadcaster(
+        bot, engine, storage, database, settings, group_id=None
+    ).run(LessonSpec.of(lesson), students)
+
+    assert report.sent == 2, "без курса проверка членства не применяется"
+
+
+async def test_group_from_settings_becomes_a_course_once(database) -> None:
+    """Единственная группа из настроек переезжает в курсы сама, но не повторно."""
+    async with database.session_factory() as session:
+        first = await ensure_default_course(session, -100777, "Курс")
+        assert first is not None and first.chat_id == -100777
+
+        # Второй запуск ничего не трогает.
+        assert await ensure_default_course(session, -100888, "Другой") is None
+        assert [c.chat_id for c in await list_courses(session)] == [-100777]
+
+
+async def test_disabled_course_is_not_offered(database) -> None:
+    """Выключенный курс не должен участвовать в рассылке."""
+    async with database.session_factory() as session:
+        course = await add_course(session, title="Старый поток", chat_id=-100999)
+        await set_course_active(session, course, False)
+
+        assert await list_courses(session) == []
+        assert len(await list_courses(session, only_active=False)) == 1
 
 
 async def test_unrelated_image_is_not_attributed(

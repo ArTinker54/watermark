@@ -11,7 +11,7 @@ import asyncio
 import logging
 
 from app.bots.admin.setup import build_admin
-from app.bots.runtime import make_bot, run_bots
+from app.bots.runtime import make_bot, migrate_group_to_course, run_bots
 from app.config import get_settings
 from app.db import create_database
 from app.logging_setup import setup_logging
@@ -30,6 +30,7 @@ async def main() -> None:
 
     database = create_database(settings)
     await database.create_all()
+    await migrate_group_to_course(database, settings)
 
     student_bot = make_bot(settings.student_bot_token)
     runtime = build_admin(settings, database, student_bot=student_bot)

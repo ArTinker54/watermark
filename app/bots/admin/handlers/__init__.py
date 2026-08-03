@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from aiogram import Router
 
-from app.bots.admin.handlers import lessons, questions, recipients, stats, trace
+from app.bots.admin.handlers import courses, lessons, questions, recipients, stats, trace
 
 
 def build_router() -> Router:
@@ -13,6 +13,7 @@ def build_router() -> Router:
     router = Router(name="admin")
     router.include_router(lessons.router)
     router.include_router(questions.router)
+    router.include_router(courses.router)
     router.include_router(recipients.router)
     router.include_router(trace.router)
     router.include_router(stats.router)

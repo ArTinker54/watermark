@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -21,9 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
+from app.db import Course
 from app.db.repo import (
+    get_course,
     get_uploaded_video,
     list_active_students,
+    list_courses,
     mark_video_used,
     take_unused_video,
 )
@@ -49,17 +53,25 @@ class NewLesson(StatesGroup):
     confirming = State()
 
 
-def _confirm_keyboard(recipients: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"Разослать ({recipients})", callback_data=SEND_CALLBACK
-                )
-            ],
-            [InlineKeyboardButton(text="Отменить", callback_data=CANCEL_CALLBACK)],
+def _confirm_keyboard(courses: Sequence[Course]) -> InlineKeyboardMarkup:
+    """Кнопка на каждый курс: автор выбирает, чьей аудитории это адресовано.
+
+    Без курсов остаётся одна кнопка — материал уйдёт всем зарегистрированным,
+    как было до их появления.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"Разослать: {course.title}",
+                callback_data=f"{SEND_CALLBACK}:{course.id}",
+            )
         ]
-    )
+        for course in courses
+    ]
+    if not rows:
+        rows = [[InlineKeyboardButton(text="Разослать всем", callback_data=f"{SEND_CALLBACK}:0")]]
+    rows.append([InlineKeyboardButton(text="Отменить", callback_data=CANCEL_CALLBACK)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _staged_paths(state: FSMContext) -> list[Path]:
@@ -202,10 +214,13 @@ async def finish_collecting(
             "Если он утечёт, определить источник будет нельзя.",
         ]
 
-    await message.answer("\n".join(lines), reply_markup=_confirm_keyboard(len(students)))
+    courses = list(await list_courses(session))
+    if courses:
+        lines.append("\n<b>Кому отправляем?</b> Получат только участники выбранного курса.")
+    await message.answer("\n".join(lines), reply_markup=_confirm_keyboard(courses))
 
 
-@router.callback_query(NewLesson.confirming, F.data == SEND_CALLBACK)
+@router.callback_query(NewLesson.confirming, F.data.startswith(f"{SEND_CALLBACK}:"))
 async def send_lesson(
     callback: CallbackQuery,
     state: FSMContext,
@@ -228,6 +243,9 @@ async def send_lesson(
         await state.clear()
         return
 
+    course_id = int(str(callback.data).rsplit(":", 1)[-1]) or None
+    course = await get_course(session, course_id) if course_id else None
+
     students = await list_active_students(session)
     lesson = await save_lesson(
         session,
@@ -238,6 +256,7 @@ async def send_lesson(
         max_side=settings.lesson_max_side,
         video_file_id=video.file_id if video else None,
         video_kind=video.kind if video else None,
+        course_id=course.id if course else None,
     )
     if video is not None:
         # Помечаем использованным, иначе то же видео прицепится к следующему уроку.
@@ -269,7 +288,10 @@ async def send_lesson(
         LessonSpec.of(lesson), students, on_progress=on_progress
     )
 
-    await message.answer(format_report(f"Урок #{lesson.id} разослан", report))
+    title = f"Урок #{lesson.id} разослан"
+    if course is not None:
+        title += f" — {course.title}"
+    await message.answer(format_report(title, report))
 
 
 @router.callback_query(NewLesson.confirming, F.data == CANCEL_CALLBACK)

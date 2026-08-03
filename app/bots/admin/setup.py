@@ -22,6 +22,7 @@ from app.watermark import WatermarkEngine
 COMMANDS = [
     BotCommand(command="newlesson", description="Новый урок и рассылка"),
     BotCommand(command="questions", description="Вопросы без ответа"),
+    BotCommand(command="courses", description="Курсы: группы и каналы"),
     BotCommand(command="recipients", description="Сколько человек получит урок"),
     BotCommand(command="lessons", description="Материалы и число получателей"),
     BotCommand(command="trace", description="Найти источник утечки"),

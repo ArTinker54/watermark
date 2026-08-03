@@ -50,6 +50,8 @@ class LessonSpec:
     images: tuple[Path, ...]
     video_file_id: str | None = None
     video_kind: str | None = None
+    course_chat_id: int | None = None
+    """Чат курса, членство в котором даёт право на этот материал."""
 
     @classmethod
     def of(cls, lesson: Lesson) -> LessonSpec:
@@ -59,6 +61,7 @@ class LessonSpec:
             images=tuple(Path(image.path) for image in lesson.images),
             video_file_id=lesson.video_file_id,
             video_kind=lesson.video_kind,
+            course_chat_id=lesson.course.chat_id if lesson.course else None,
         )
 
     @property
@@ -208,10 +211,11 @@ class LessonBroadcaster:
         регистрации: там отказ человек переживёт и повторит попытку, а тут из-за
         случайной ошибки API оплативший ученик молча не получил бы урок.
         """
-        if self._group_id is None:
+        gate = lesson.course_chat_id if lesson.course_chat_id is not None else self._group_id
+        if gate is None:
             return list(students)
 
-        kept, dropped = await self.split_by_membership(students)
+        kept, dropped = await self.split_by_membership(students, chat_id=gate)
         for student in dropped:
             # Запись пропуска в базу тоже может не удаться (SQLITE_BUSY, диск).
             # Это не повод лишать урока остальных: сам факт пропуска уже
@@ -231,18 +235,19 @@ class LessonBroadcaster:
         return kept
 
     async def split_by_membership(
-        self, students: Sequence[Student]
+        self, students: Sequence[Student], *, chat_id: int | None = None
     ) -> tuple[list[Student], list[Student]]:
-        """Разделить на тех, кто в группе, и тех, кого там уже нет.
+        """Разделить на тех, кто в чате курса, и тех, кого там уже нет.
 
         Ничего не пишет в базу — годится и для рассылки, и для того, чтобы
         просто посмотреть текущее число получателей.
         """
-        if self._group_id is None:
+        gate = chat_id if chat_id is not None else self._group_id
+        if gate is None:
             return list(students), []
 
         verdicts = await asyncio.gather(
-            *(self._entitled(student) for student in students), return_exceptions=True
+            *(self._entitled(student, gate) for student in students), return_exceptions=True
         )
 
         kept: list[Student] = []
@@ -263,13 +268,12 @@ class LessonBroadcaster:
                 dropped.append(student)
         return kept, dropped
 
-    async def _entitled(self, student: Student) -> bool:
+    async def _entitled(self, student: Student, chat_id: int) -> bool:
         """Один запрос о членстве — через ту же очередь и повторы, что и отправки."""
-        assert self._group_id is not None
         return await self._call(
             is_group_member,
             bot=self._bot,
-            group_id=self._group_id,
+            group_id=chat_id,
             user_id=student.tg_user_id,
         )
 

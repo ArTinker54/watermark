@@ -53,6 +53,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str, str | None], ...] = (
     ("lessons", "question_id", "INTEGER REFERENCES questions(id)", "ix_lessons_question_id"),
     ("lessons", "video_file_id", "VARCHAR(256)", None),
     ("lessons", "video_kind", "VARCHAR(16)", None),
+    ("lessons", "course_id", "INTEGER REFERENCES courses(id)", "ix_lessons_course_id"),
 )
 
 

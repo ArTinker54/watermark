@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
+    Course,
     Delivery,
     DeliveryStatus,
     Lesson,
@@ -150,6 +151,7 @@ async def create_lesson(
     question_id: int | None = None,
     video_file_id: str | None = None,
     video_kind: str | None = None,
+    course_id: int | None = None,
 ) -> Lesson:
     """Создать урок. Коммитит сама.
 
@@ -171,6 +173,7 @@ async def create_lesson(
         question_id=question_id,
         video_file_id=video_file_id,
         video_kind=video_kind,
+        course_id=course_id,
         images=[],
     )
     session.add(lesson)
@@ -191,7 +194,9 @@ async def create_lesson(
         ]
     )
     await session.commit()
-    await session.refresh(lesson, attribute_names=["images"])
+    # Подгружаем связи явно: объект уедет из сессии к вызывающему, и ленивая
+    # загрузка там уже невозможна — в async она просто падает.
+    await session.refresh(lesson, attribute_names=["images", "course", "question"])
     return lesson
 
 
@@ -328,6 +333,62 @@ async def get_delivery(
         )
     )
     return result.scalar_one_or_none()
+
+
+# --- Курсы ---------------------------------------------------------------------
+
+
+async def list_courses(session: AsyncSession, *, only_active: bool = True) -> Sequence[Course]:
+    query = select(Course).order_by(Course.id)
+    if only_active:
+        query = query.where(Course.is_active.is_(True))
+    result = await session.execute(query)
+    return result.scalars().all()
+
+
+async def get_course(session: AsyncSession, course_id: int) -> Course | None:
+    result = await session.execute(select(Course).where(Course.id == course_id))
+    return result.scalar_one_or_none()
+
+
+async def get_course_by_chat(session: AsyncSession, chat_id: int) -> Course | None:
+    result = await session.execute(select(Course).where(Course.chat_id == chat_id))
+    return result.scalar_one_or_none()
+
+
+async def add_course(session: AsyncSession, *, title: str, chat_id: int) -> Course:
+    """Завести курс. Коммитит сама. Повторный вызов чинит название и активность."""
+    existing = await get_course_by_chat(session, chat_id)
+    if existing is not None:
+        existing.title = title
+        existing.is_active = True
+        await session.commit()
+        return existing
+
+    course = Course(title=title, chat_id=chat_id)
+    session.add(course)
+    await session.commit()
+    return course
+
+
+async def set_course_active(session: AsyncSession, course: Course, active: bool) -> None:
+    """Выключенный курс не предлагается при рассылке и не даёт доступа. Коммитит сама."""
+    course.is_active = active
+    await session.commit()
+
+
+async def ensure_default_course(session: AsyncSession, chat_id: int, title: str) -> Course | None:
+    """Перенести единственную группу из настроек в курсы при первом запуске.
+
+    Раньше группа была одна и жила в VSA_GROUP_ID. Чтобы обновление не потребовало
+    ручных действий, она заводится курсом автоматически — но только если курсов
+    ещё нет вовсе, иначе мы бы вмешивались в то, что автор уже настроил.
+    """
+    if await list_courses(session, only_active=False):
+        return None
+    course = await add_course(session, title=title, chat_id=chat_id)
+    logger.info("группа из настроек заведена курсом: %s", course)
+    return course
 
 
 # --- Видео ---------------------------------------------------------------------
