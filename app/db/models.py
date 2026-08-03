@@ -134,6 +134,43 @@ class Question(Base):
         return "(без текста, только картинка)"
 
 
+class UploadedVideo(Base):
+    """Видео, загруженное автором в student-бота и готовое к рассылке.
+
+    Файл никуда не скачивается: хранится только идентификатор, по которому
+    Telegram отдаёт его получателям. Поэтому размер ограничен лишь тем, что
+    Telegram разрешает загрузить самому автору, а не лимитом Bot API в 20 МБ.
+
+    Идентификатор файла привязан к КОНКРЕТНОМУ боту, поэтому видео принимает
+    именно тот бот, который потом будет его раздавать.
+    """
+
+    __tablename__ = "uploaded_videos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    admin_tg_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    file_id: Mapped[str] = mapped_column(String(256))
+    file_unique_id: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(16), default="video")
+    """``video`` или ``document``. Отправлять надо тем же способом, каким
+    получили: идентификатор документа метод sendVideo не примет."""
+
+    file_name: Mapped[str | None] = mapped_column(String(256), default=None)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    duration: Mapped[int | None] = mapped_column(Integer, default=None)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @property
+    def summary(self) -> str:
+        parts = [self.file_name or "видео"]
+        if self.duration:
+            parts.append(f"{self.duration // 60}:{self.duration % 60:02d}")
+        if self.file_size:
+            parts.append(f"{self.file_size / 1024 / 1024:.0f} МБ")
+        return " · ".join(parts)
+
+
 class Lesson(Base):
     """Материал: текст поста и пристинные оригиналы картинок (без метки!).
 
@@ -153,6 +190,12 @@ class Lesson(Base):
         ForeignKey("questions.id", ondelete="SET NULL"), default=None, index=True
     )
     """Заполнено, если материал — ответ на вопрос ученика."""
+
+    video_file_id: Mapped[str | None] = mapped_column(String(256), default=None)
+    """Идентификатор видео у student-бота. Метки в видео нет — см. README."""
+
+    video_kind: Mapped[str | None] = mapped_column(String(16), default=None)
+    """``video`` или ``document`` — каким способом видео отправлять."""
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

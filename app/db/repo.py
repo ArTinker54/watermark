@@ -26,6 +26,7 @@ from app.db.models import (
     Student,
     StudentStatus,
     TraceAttempt,
+    UploadedVideo,
     utcnow,
 )
 from app.watermark.payload import MAX_UID
@@ -147,6 +148,8 @@ async def create_lesson(
     caption: str | None,
     materialize: Callable[[int], Sequence[ImageSpec]],
     question_id: int | None = None,
+    video_file_id: str | None = None,
+    video_kind: str | None = None,
 ) -> Lesson:
     """Создать урок. Коммитит сама.
 
@@ -166,6 +169,8 @@ async def create_lesson(
         caption=caption,
         original_image_path="",
         question_id=question_id,
+        video_file_id=video_file_id,
+        video_kind=video_kind,
         images=[],
     )
     session.add(lesson)
@@ -323,6 +328,57 @@ async def get_delivery(
         )
     )
     return result.scalar_one_or_none()
+
+
+# --- Видео ---------------------------------------------------------------------
+
+
+async def save_uploaded_video(
+    session: AsyncSession,
+    *,
+    admin_tg_id: int,
+    file_id: str,
+    file_unique_id: str,
+    kind: str,
+    file_name: str | None,
+    file_size: int | None,
+    duration: int | None,
+) -> UploadedVideo:
+    """Запомнить присланное автором видео. Коммитит сама."""
+    video = UploadedVideo(
+        admin_tg_id=admin_tg_id,
+        file_id=file_id,
+        file_unique_id=file_unique_id,
+        kind=kind,
+        file_name=file_name,
+        file_size=file_size,
+        duration=duration,
+    )
+    session.add(video)
+    await session.commit()
+    return video
+
+
+async def get_uploaded_video(session: AsyncSession, video_id: int) -> UploadedVideo | None:
+    result = await session.execute(select(UploadedVideo).where(UploadedVideo.id == video_id))
+    return result.scalar_one_or_none()
+
+
+async def take_unused_video(session: AsyncSession, admin_tg_id: int) -> UploadedVideo | None:
+    """Последнее ещё не разосланное видео этого автора."""
+    result = await session.execute(
+        select(UploadedVideo)
+        .where(UploadedVideo.admin_tg_id == admin_tg_id, UploadedVideo.used_at.is_(None))
+        .order_by(UploadedVideo.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def mark_video_used(session: AsyncSession, video: UploadedVideo) -> None:
+    """Пометить видео разосланным, чтобы оно не прицепилось к следующему уроку."""
+    video.used_at = utcnow()
+    await session.commit()
 
 
 # --- Вопросы -------------------------------------------------------------------

@@ -35,9 +35,12 @@ from app.db.repo import (
     list_active_students,
     list_lesson_summaries,
     list_open_questions,
+    mark_video_used,
     record_delivery,
     register_student,
+    save_uploaded_video,
     set_question_status,
+    take_unused_video,
 )
 from app.services import (
     BroadcastReport,
@@ -71,6 +74,8 @@ class SentMessage:
     caption: str | None
     text: str | None = None
     protected: bool = False
+    kind: str = "photo"
+    file_id: str | None = None
 
 
 class FakeBot:
@@ -120,6 +125,44 @@ class FakeBot:
             results.append(_FakeResult(len(self.sent)))
         return results
 
+    async def send_video(
+        self,
+        chat_id: int,
+        video: str,
+        caption: str | None = None,
+        protect_content: bool = False,
+    ) -> _FakeResult:
+        self.sent.append(
+            SentMessage(
+                chat_id=chat_id,
+                path=None,
+                caption=caption,
+                protected=protect_content,
+                kind="video",
+                file_id=video,
+            )
+        )
+        return _FakeResult(len(self.sent))
+
+    async def send_document(
+        self,
+        chat_id: int,
+        document: str,
+        caption: str | None = None,
+        protect_content: bool = False,
+    ) -> _FakeResult:
+        self.sent.append(
+            SentMessage(
+                chat_id=chat_id,
+                path=None,
+                caption=caption,
+                protected=protect_content,
+                kind="document",
+                file_id=document,
+            )
+        )
+        return _FakeResult(len(self.sent))
+
     async def send_message(
         self, chat_id: int, text: str, protect_content: bool = False
     ) -> Any:
@@ -135,7 +178,11 @@ class FakeBot:
         return _FakeResult(len(self.sent))
 
     def delivered_to(self, chat_id: int) -> list[Path]:
-        return [item.path for item in self.sent if item.chat_id == chat_id and item.path]
+        return [
+            item.path
+            for item in self.sent
+            if item.chat_id == chat_id and item.path and item.kind == "photo"
+        ]
 
 
 @dataclass
@@ -1312,6 +1359,113 @@ async def test_long_text_only_lesson_is_split(
     assert all(len(chunk) <= 4096 for chunk in chunks)
     # Метка вшита циклически, поэтому читается и из отдельного куска.
     assert extract_text(chunks[0]) == Payload(uid=student.uid, lesson_id=lesson.id)
+
+
+async def test_video_is_delivered_by_file_id(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Видео раздаётся по идентификатору: байты через бота не идут.
+
+    Именно поэтому лимит Bot API в 20 МБ на скачивание тут не действует —
+    файл уже лежит у Telegram, и он сам отдаёт его получателю.
+    """
+    student = await _register(database, 9940, "Борис")
+    async with database.session_factory() as session:
+        video = await save_uploaded_video(
+            session,
+            admin_tg_id=1,
+            file_id="BAACAgIAAxkBAAI-video-id",
+            file_unique_id="uniq-1",
+            kind="video",
+            file_name="razbor.mp4",
+            file_size=52_428_800,  # 50 МБ
+            duration=615,
+        )
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=LONG_CAPTION,
+            staged=[],
+            max_side=settings.lesson_max_side,
+            video_file_id=video.file_id,
+            video_kind=video.kind,
+        )
+        await mark_video_used(session, video)
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_video")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    assert report.sent == 1
+    sent = [item for item in bot.sent if item.chat_id == student.tg_user_id]
+    assert [item.kind for item in sent] == ["video"]
+    assert sent[0].file_id == "BAACAgIAAxkBAAI-video-id"
+    assert sent[0].protected, "защита от пересылки нужна и видео"
+
+    # Видео метки не несёт, а подпись к нему — несёт.
+    assert extract_text(sent[0].caption or "") == Payload(uid=student.uid, lesson_id=lesson.id)
+
+
+async def test_video_sent_as_file_stays_a_file(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Присланное файлом уходит файлом: идентификатор документа sendVideo не примет."""
+    student = await _register(database, 9941, "Алиса")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=None,
+            staged=[],
+            max_side=settings.lesson_max_side,
+            video_file_id="doc-file-id",
+            video_kind="document",
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_doc")
+    await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    sent = [item for item in bot.sent if item.chat_id == student.tg_user_id]
+    assert [item.kind for item in sent] == ["document"]
+
+
+async def test_used_video_is_not_reattached(database) -> None:
+    """Разосланное видео не должно прицепиться к следующему уроку."""
+    async with database.session_factory() as session:
+        video = await save_uploaded_video(
+            session,
+            admin_tg_id=77,
+            file_id="fid",
+            file_unique_id="uniq",
+            kind="video",
+            file_name=None,
+            file_size=None,
+            duration=None,
+        )
+        assert await take_unused_video(session, 77) is not None
+        await mark_video_used(session, video)
+        assert await take_unused_video(session, 77) is None
+
+    # И чужое видео не подхватится.
+    async with database.session_factory() as session:
+        await save_uploaded_video(
+            session,
+            admin_tg_id=77,
+            file_id="fid2",
+            file_unique_id="uniq2",
+            kind="video",
+            file_name=None,
+            file_size=None,
+            duration=None,
+        )
+        assert await take_unused_video(session, 999) is None
 
 
 async def test_unrelated_image_is_not_attributed(

@@ -21,7 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
-from app.db.repo import list_active_students
+from app.db.repo import (
+    get_uploaded_video,
+    list_active_students,
+    mark_video_used,
+    take_unused_video,
+)
 from app.services import LessonBroadcaster, LessonSpec, Storage, save_lesson
 from app.utils import CAPTION_LIMIT, split_text
 from app.watermark import image_size
@@ -72,6 +77,8 @@ async def start_new_lesson(message: Message, state: FSMContext, storage: Storage
         "<b>Новый урок</b>\n\n"
         "Пришлите картинку (или несколько) и текст поста.\n\n"
         "• Можно только текст, без картинок — например объявление.\n"
+        "• Видео присылайте боту рассылки, оно прицепится само. "
+        "Метки в видео не будет.\n"
         "• Текст можно отправить подписью к картинке или отдельным сообщением.\n"
         "• Лучше слать картинки <b>файлом</b>, а не фото: так оригинал "
         "сохранится без пережатия.\n\n"
@@ -117,12 +124,19 @@ async def collect_caption(message: Message, state: FSMContext) -> None:
 async def finish_collecting(
     message: Message, state: FSMContext, session: AsyncSession, settings: Settings
 ) -> None:
+    if message.from_user is None:
+        return
+
     data = await state.get_data()
     images = [Path(item) for item in data.get("images", [])]
     caption: str | None = data.get("caption")
-    if not images and not caption:
-        await message.answer("Ни картинок, ни текста — отправлять нечего.")
+    video = await take_unused_video(session, message.from_user.id)
+    if not images and not caption and video is None:
+        await message.answer("Ни картинок, ни текста, ни видео — отправлять нечего.")
         return
+
+    if video is not None:
+        await state.update_data(video_id=video.id)
 
     students = await list_active_students(session)
     if not students:
@@ -143,7 +157,10 @@ async def finish_collecting(
         for chunk in split_text(caption):
             await message.answer(chunk)
 
-    lines = [f"Картинок: {len(images)}", f"Зарегистрировано учеников: {len(students)}"]
+    lines = [f"Картинок: {len(images)}"]
+    if video is not None:
+        lines.append(f"Видео: {video.summary}")
+    lines.append(f"Зарегистрировано учеников: {len(students)}")
     if settings.vsa_group_id is not None:
         # Точное число получателей известно только в момент рассылки: членство
         # сверяется тогда же. Обещать здесь «получателей N» было бы неправдой.
@@ -156,6 +173,12 @@ async def finish_collecting(
             "иначе метка не читается со скриншота чата."
         )
     marked_text = bool(caption) and text_fits(caption or "")
+    if video is not None:
+        # Про видео молчать нельзя: оно уходит без метки, и автор должен
+        # понимать разницу между ним и картинками.
+        lines.append(
+            "\n⚠️ <b>Видео уйдёт без метки</b> — по нему источник утечки не определить."
+        )
     if images:
         lines.append("\nКаждый получит свою копию с личной меткой.")
         if caption:
@@ -167,6 +190,8 @@ async def finish_collecting(
             )
     elif marked_text:
         lines.append("\nМетка будет вшита в текст: каждый получит свою копию.")
+    elif video is not None:
+        lines.append(f"Текст тоже без метки: в нём меньше {MIN_GAPS + 1} слов.")
     else:
         # Без картинок и без длинного текста метки нет вообще. Молчать об этом
         # нельзя: автор вправе думать, что помечено всё, что уходит через бота.
@@ -197,7 +222,8 @@ async def send_lesson(
     data = await state.get_data()
     staged = [Path(item) for item in data.get("images", [])]
     caption: str | None = data.get("caption")
-    if not staged and not caption:
+    video = await get_uploaded_video(session, data["video_id"]) if data.get("video_id") else None
+    if not staged and not caption and video is None:
         await message.answer("Черновик потерян. Начните заново: /newlesson")
         await state.clear()
         return
@@ -210,7 +236,12 @@ async def send_lesson(
         caption=caption,
         staged=staged,
         max_side=settings.lesson_max_side,
+        video_file_id=video.file_id if video else None,
+        video_kind=video.kind if video else None,
     )
+    if video is not None:
+        # Помечаем использованным, иначе то же видео прицепится к следующему уроку.
+        await mark_video_used(session, video)
     Storage.drop_staging(Path(data["staging"]))
     await state.clear()
 

@@ -14,6 +14,7 @@ from app.db.models import (
     Student,
     StudentStatus,
     TraceAttempt,
+    UploadedVideo,
     utcnow,
 )
 
@@ -29,6 +30,7 @@ __all__ = [
     "Student",
     "StudentStatus",
     "TraceAttempt",
+    "UploadedVideo",
     "create_database",
     "utcnow",
 ]

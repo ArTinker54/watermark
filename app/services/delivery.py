@@ -48,6 +48,8 @@ class LessonSpec:
     lesson_id: int
     caption: str | None
     images: tuple[Path, ...]
+    video_file_id: str | None = None
+    video_kind: str | None = None
 
     @classmethod
     def of(cls, lesson: Lesson) -> LessonSpec:
@@ -55,6 +57,8 @@ class LessonSpec:
             lesson_id=lesson.id,
             caption=lesson.caption,
             images=tuple(Path(image.path) for image in lesson.images),
+            video_file_id=lesson.video_file_id,
+            video_kind=lesson.video_kind,
         )
 
     @property
@@ -317,7 +321,9 @@ class LessonBroadcaster:
             caption = text_embed(caption, payload) or caption
 
         try:
-            message_id = await self._send(student.tg_user_id, caption, marked)
+            message_id = await self._send(
+                student.tg_user_id, caption, marked, lesson.video_file_id, lesson.video_kind
+            )
         except TelegramForbiddenError:
             await self._block(student)
             return await self._fail(lesson, student, payload, "ученик заблокировал бота")
@@ -354,8 +360,20 @@ class LessonBroadcaster:
             result.append(target)
         return result
 
-    async def _send(self, chat_id: int, caption: str | None, images: Sequence[Path]) -> int | None:
+    async def _send(
+        self,
+        chat_id: int,
+        caption: str | None,
+        images: Sequence[Path],
+        video_file_id: str | None = None,
+        video_kind: str | None = None,
+    ) -> int | None:
         """Отправить пост. Длинный текст уезжает отдельным сообщением."""
+        if video_file_id is not None:
+            return await self._send_video(
+                chat_id, caption, video_file_id, video_kind or "video", images
+            )
+
         if not images:
             # Материал из одного текста: объявление, напоминание. Метку несёт
             # сам текст, если он достаточно длинный.
@@ -397,6 +415,55 @@ class LessonBroadcaster:
                     protect_content=self._protect,
                 )
 
+        return message_id
+
+    async def _send_video(
+        self,
+        chat_id: int,
+        caption: str | None,
+        video_file_id: str,
+        video_kind: str,
+        images: Sequence[Path],
+    ) -> int | None:
+        """Отправить видео по идентификатору — байты через бота не идут.
+
+        Именно поэтому размер файла тут не упирается в лимит Bot API на
+        скачивание: Telegram сам отдаёт получателю уже лежащий у него файл.
+
+        Отправляем тем же методом, каким получили: идентификатор документа
+        метод sendVideo не примет, и наоборот.
+
+        Метки в видео нет. Персональной остаётся только подпись, если она
+        достаточно длинная, — и картинки, если автор приложил их вдобавок.
+        """
+        inline_caption = caption if caption and len(caption) <= CAPTION_LIMIT else None
+        if video_kind == "document":
+            message = await self._call(
+                self._bot.send_document,
+                chat_id=chat_id,
+                document=video_file_id,
+                caption=inline_caption,
+                protect_content=self._protect,
+            )
+        else:
+            message = await self._call(
+                self._bot.send_video,
+                chat_id=chat_id,
+                video=video_file_id,
+                caption=inline_caption,
+                protect_content=self._protect,
+            )
+        message_id: int | None = message.message_id
+
+        if caption and inline_caption is None:
+            await self._send_text(chat_id, caption)
+        for path in images:
+            await self._call(
+                self._bot.send_photo,
+                chat_id=chat_id,
+                photo=FSInputFile(path),
+                protect_content=self._protect,
+            )
         return message_id
 
     async def _send_text(self, chat_id: int, text: str) -> int | None:

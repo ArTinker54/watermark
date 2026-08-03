@@ -48,6 +48,8 @@ async def save_lesson(
     staged: Sequence[Path],
     max_side: int,
     question_id: int | None = None,
+    video_file_id: str | None = None,
+    video_kind: str | None = None,
 ) -> Lesson:
     """Превратить черновик в урок.
 
@@ -58,8 +60,8 @@ async def save_lesson(
     Материал без картинок допустим: объявление из одного текста метку несёт
     само. А вот пустой материал — нет, отправлять было бы нечего.
     """
-    if not staged and not caption:
-        raise ValueError("материал без картинок и без текста отправлять нечего")
+    if not staged and not caption and video_file_id is None:
+        raise ValueError("материал без картинок, текста и видео отправлять нечего")
 
     def materialize(lesson_id: int) -> list[ImageSpec]:
         specs: list[ImageSpec] = []
@@ -75,6 +77,8 @@ async def save_lesson(
         caption=caption,
         materialize=materialize,
         question_id=question_id,
+        video_file_id=video_file_id,
+        video_kind=video_kind,
     )
     sizes = ", ".join(f"{image.width}x{image.height}" for image in lesson.images)
     logger.info(
