@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from html import escape as quote
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -61,8 +62,8 @@ def question_card(question: Question, student: Student) -> tuple[str, InlineKeyb
     """Карточка вопроса для автора: что спросили, кто и что можно сделать."""
     text = (
         f"<b>Вопрос №{question.id}</b>\n"
-        f"От: <b>{student.uid_str}</b> — {student.display_name}\n\n"
-        f"{question.preview}"
+        f"От: <b>{student.uid_str}</b> — {quote(student.display_name)}\n\n"
+        f"{quote(question.preview)}"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -346,17 +347,22 @@ async def send_answer(
 
 
 def _compose(question: Question, *, body: str | None, audience: str, with_name: bool) -> str:
-    """Собрать текст ответа: заголовок с вопросом плюс текст автора."""
+    """Собрать текст ответа: заголовок с вопросом плюс текст автора.
+
+    Имя и текст вопроса пишет ученик, поэтому они экранируются: одинокая «<» в
+    имени сделала бы разметку битой, и Telegram отверг бы ответ у всех сразу.
+    """
     if audience == "personal":
         header = f"<b>Ответ на ваш вопрос №{question.id}</b>"
     elif with_name:
-        header = f"<b>Ответ на вопрос №{question.id} от {question.student.display_name}</b>"
+        who = quote(question.student.display_name)
+        header = f"<b>Ответ на вопрос №{question.id} от {who}</b>"
     else:
         header = f"<b>Ответ на вопрос №{question.id}</b>"
 
     parts = [header]
     if question.text:
-        parts.append(f"<i>{question.preview}</i>")
+        parts.append(f"<i>{quote(question.preview)}</i>")
     if body:
         parts.append(body)
     return "\n\n".join(parts)

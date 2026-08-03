@@ -16,6 +16,7 @@ from app.watermark.text import (
     extract,
     fits,
     gaps,
+    has_marks,
     strip_marks,
 )
 
@@ -211,3 +212,76 @@ def test_two_students_get_different_text() -> None:
     assert first is not None and second is not None
     assert first != second
     assert strip_marks(first) == strip_marks(second) == LONG
+
+
+EMOJI_FAMILY = "👨‍👩‍👧"
+EMOJI_CODER = "👩‍💻"
+
+
+def test_compound_emoji_survive_the_mark() -> None:
+    """Метка не имеет права портить эмодзи в подписи.
+
+    В алфавите стоял U+200D ZERO WIDTH JOINER — тот самый символ, который
+    склеивает 👩 и 💻 в 👩‍💻. Вырезая его перед вставкой метки, embed разбирал
+    каждое составное эмодзи на части у всех получателей сразу.
+    """
+    text = f"{EMOJI_FAMILY} " + ("слово " * 40) + EMOJI_CODER
+    marked = embed(text, Payload(uid=7, lesson_id=3))
+
+    assert marked is not None
+    assert EMOJI_FAMILY in marked, "семья эмодзи распалась на отдельные фигурки"
+    assert EMOJI_CODER in marked
+    assert strip_marks(marked) == text
+    assert extract(marked) == Payload(uid=7, lesson_id=3)
+
+
+def test_emoji_alone_is_not_mistaken_for_a_mark() -> None:
+    """Обычное сообщение с эмодзи не должно выглядеть помеченным.
+
+    Иначе бот принимал бы любую заметку автора самому себе за утёкший текст и
+    лез бы её опознавать.
+    """
+    assert not has_marks(f"Смотрите график {EMOJI_CODER} внимательно")
+
+
+def test_lone_angle_bracket_is_not_lost() -> None:
+    """Одинокая «<» не покрывалась регуляркой и молча пропадала у ученика."""
+    text = "цена < 100 " + ("слово " * 40)
+    marked = embed(text, Payload(uid=8, lesson_id=4))
+
+    assert marked is not None
+    assert strip_marks(marked) == text, "текст изменился помимо метки"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a < b " + ("слово " * 40),
+        "<b>жирный</b> " + ("слово " * 40),
+        "<<< " + ("слово " * 40),
+        "неполный <тег " + ("слово " * 40),
+        f"{EMOJI_FAMILY} " + ("слово " * 40),
+    ],
+)
+def test_embed_changes_nothing_but_the_mark(text: str) -> None:
+    """Инвариант: снять метку — получить ровно исходный текст."""
+    marked = embed(text, Payload(uid=9, lesson_id=5))
+    assert marked is not None
+    assert strip_marks(marked) == text
+
+
+def test_marks_from_the_old_alphabet_are_still_read() -> None:
+    """Тексты, размеченные до отказа от ZWJ, обязаны читаться по-прежнему.
+
+    Материалы с такой меткой уже у людей на руках, и терять по ним
+    трассировку нельзя.
+    """
+    payload = Payload(uid=42, lesson_id=13)
+    text = "слово " * 40
+    marked = embed(text, payload)
+    assert marked is not None
+
+    # Возвращаем прежний алфавит: третий символ был ZWJ.
+    legacy = marked.replace("\u2061", "\u200d")
+    assert legacy != marked, "в метке должен был встретиться третий символ"
+    assert extract(legacy) == payload
