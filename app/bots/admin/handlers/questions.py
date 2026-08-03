@@ -37,7 +37,8 @@ from app.db.repo import (
     set_question_status,
 )
 from app.services import LessonBroadcaster, LessonSpec, Storage, save_lesson
-from app.utils import CAPTION_LIMIT, split_text
+from app.services.delivery import MEDIA_GROUP_LIMIT
+from app.utils import CAPTION_LIMIT, split_html
 from app.watermark import image_size
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,12 @@ async def start_answer(
 async def collect_answer_image(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     images: list[str] = list(data.get("images", []))
+    if len(images) >= MEDIA_GROUP_LIMIT:
+        await message.answer(
+            f"Больше {MEDIA_GROUP_LIMIT} картинок в один ответ не поместится — "
+            "столько Telegram не берёт в один альбом."
+        )
+        return
     try:
         target = Storage.staged_original(Path(data["staging"]), len(images))
         width, height = await download_image(bot, extract_file_id(message), target)
@@ -193,7 +200,7 @@ async def finish_answer(
             caption=caption if caption and len(caption) <= CAPTION_LIMIT else None,
         )
     if caption and (not images or len(caption) > CAPTION_LIMIT):
-        for chunk in split_text(caption):
+        for chunk in split_html(caption):
             await message.answer(chunk)
 
     courses = list(await list_courses(session))

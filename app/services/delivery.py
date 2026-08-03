@@ -26,6 +26,7 @@ from app.db import DeliveryStatus, Lesson, Student, StudentStatus
 from app.db.repo import record_delivery, set_student_status
 from app.services.membership import CourseUnreachable, is_group_member
 from app.services.storage import Storage
+from app.utils import split_html
 from app.watermark import Payload, WatermarkEngine, WatermarkError, embed_async
 from app.watermark.text import embed as text_embed
 from app.watermark.text import fits as text_fits
@@ -35,6 +36,9 @@ logger = logging.getLogger(__name__)
 #: Лимиты Telegram на длину подписи к фото и обычного сообщения.
 CAPTION_LIMIT = 1024
 TEXT_LIMIT = 4096
+#: Сколько картинок принимает одна медиагруппа. Одиннадцатую Bot API отвергает,
+#: и без разбиения материал не дошёл бы вообще ни до кого.
+MEDIA_GROUP_LIMIT = 10
 #: Сколько раз повторить отправку при 429/5xx.
 SEND_RETRIES = 3
 
@@ -132,8 +136,9 @@ class RateLimiter:
             await asyncio.sleep(delay)
 
 
-def _split_text(text: str, limit: int = TEXT_LIMIT) -> list[str]:
-    return [text[start : start + limit] for start in range(0, len(text), limit)] or [text]
+def _batched(images: Sequence[Path], size: int = MEDIA_GROUP_LIMIT) -> list[Sequence[Path]]:
+    """Разбить картинки на медиагруппы допустимого размера."""
+    return [images[start : start + size] for start in range(0, len(images), size)]
 
 
 class LessonBroadcaster:
@@ -426,6 +431,7 @@ class LessonBroadcaster:
 
         inline_caption = caption if caption and len(caption) <= CAPTION_LIMIT else None
 
+        message_id: int | None = None
         if len(images) == 1:
             message = await self._call(
                 self._bot.send_photo,
@@ -434,25 +440,32 @@ class LessonBroadcaster:
                 caption=inline_caption,
                 protect_content=self._protect,
             )
-            message_id: int | None = message.message_id
+            message_id = message.message_id
         else:
-            media = [
-                InputMediaPhoto(
-                    media=FSInputFile(path),
-                    caption=inline_caption if index == 0 else None,
+            # Больше десяти картинок в одну группу Bot API не берёт, а числа
+            # картинок в материале ничто не ограничивает. Шлём несколькими
+            # группами: лучше два альбома, чем отказ у всех получателей.
+            for batch_index, batch in enumerate(_batched(images)):
+                media = [
+                    InputMediaPhoto(
+                        media=FSInputFile(path),
+                        caption=(
+                            inline_caption if batch_index == 0 and index == 0 else None
+                        ),
+                    )
+                    for index, path in enumerate(batch)
+                ]
+                sent = await self._call(
+                    self._bot.send_media_group,
+                    chat_id=chat_id,
+                    media=media,
+                    protect_content=self._protect,
                 )
-                for index, path in enumerate(images)
-            ]
-            sent = await self._call(
-                self._bot.send_media_group,
-                chat_id=chat_id,
-                media=media,
-                protect_content=self._protect,
-            )
-            message_id = sent[0].message_id if sent else None
+                if message_id is None and sent:
+                    message_id = sent[0].message_id
 
         if caption and inline_caption is None:
-            for chunk in _split_text(caption):
+            for chunk in split_html(caption):
                 await self._call(
                     self._bot.send_message,
                     chat_id=chat_id,
@@ -518,7 +531,7 @@ class LessonBroadcaster:
         ни к чему не привязана.
         """
         first: int | None = None
-        for chunk in _split_text(text):
+        for chunk in split_html(text):
             message = await self._call(
                 self._bot.send_message,
                 chat_id=chat_id,

@@ -20,7 +20,7 @@ from app.config import Settings
 from app.db.repo import get_student_by_tg_id, list_courses, register_student
 from app.services.membership import in_any_course
 from app.texts import load_offer
-from app.utils import split_text
+from app.utils import split_html
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def _welcome(uid_str: str) -> str:
 
 
 async def _send_offer(message: Message, settings: Settings) -> None:
-    chunks = split_text(load_offer(settings.offer_path))
+    chunks = split_html(load_offer(settings.offer_path))
     for chunk in chunks[:-1]:
         await message.answer(chunk)
     await message.answer(chunks[-1], reply_markup=_consent_keyboard())

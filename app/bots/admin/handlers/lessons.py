@@ -32,7 +32,8 @@ from app.db.repo import (
     take_unused_video,
 )
 from app.services import LessonBroadcaster, LessonSpec, Storage, save_lesson
-from app.utils import CAPTION_LIMIT, split_text
+from app.services.delivery import MEDIA_GROUP_LIMIT
+from app.utils import CAPTION_LIMIT, split_html
 from app.watermark import image_size
 from app.watermark.text import MIN_GAPS
 from app.watermark.text import fits as text_fits
@@ -43,6 +44,10 @@ router = Router(name="lessons")
 
 SEND_CALLBACK = "newlesson:send"
 CANCEL_CALLBACK = "newlesson:cancel"
+
+#: Сколько картинок влезает в один материал. Ограничение не наше: медиагруппа
+#: Bot API принимает не больше десяти, одиннадцатую отвергает целиком.
+MAX_IMAGES = MEDIA_GROUP_LIMIT
 
 #: Как часто обновлять сообщение с прогрессом рассылки.
 _PROGRESS_EVERY = 5
@@ -106,6 +111,14 @@ async def collect_image(
     staging = Path(data["staging"])
     images: list[str] = list(data.get("images", []))
 
+    if len(images) >= MAX_IMAGES:
+        await message.answer(
+            f"Больше {MAX_IMAGES} картинок в один материал не поместится — "
+            "столько Telegram не берёт в один альбом. Отправьте остальное "
+            "вторым материалом."
+        )
+        return
+
     try:
         file_id = extract_file_id(message)
         target = Storage.staged_original(staging, len(images))
@@ -166,7 +179,7 @@ async def finish_collecting(
             caption=caption if caption and len(caption) <= CAPTION_LIMIT else None,
         )
     if caption and (not images or len(caption) > CAPTION_LIMIT):
-        for chunk in split_text(caption):
+        for chunk in split_html(caption):
             await message.answer(chunk)
 
     lines = [f"Картинок: {len(images)}"]

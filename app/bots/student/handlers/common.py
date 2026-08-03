@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.repo import get_student_by_tg_id
 from app.texts import load_offer
-from app.utils import split_text
+from app.utils import split_html
 
 router = Router(name="common")
 # Только личка: в группе бот молчит, см. registration.py.
@@ -51,7 +51,7 @@ async def handle_id(message: Message, session: AsyncSession) -> None:
 
 @router.message(Command("offer"))
 async def handle_offer(message: Message, settings: Settings) -> None:
-    for chunk in split_text(load_offer(settings.offer_path)):
+    for chunk in split_html(load_offer(settings.offer_path)):
         await message.answer(chunk)
 
 
