@@ -154,6 +154,9 @@ async def create_lesson(
     пристинные оригиналы по местам, вернув их описания. Порядок именно такой,
     потому что путь к файлам содержит id, а id известен только после flush;
     зато не нужен ни второй UPDATE, ни временные пути в базе.
+
+    Картинок может не быть вовсе: объявление из одного текста — тоже материал,
+    и метку теперь несёт сам текст.
     """
     # images=[] инициализирует коллекцию сразу: после flush объект становится
     # persistent, и присваивание в незагруженную связь дёрнуло бы ленивый SELECT
@@ -169,11 +172,7 @@ async def create_lesson(
     await session.flush()
 
     images = list(materialize(lesson.id))
-    if not images:
-        await session.rollback()
-        raise ValueError("урок без картинок не имеет смысла: метку некуда вшивать")
-
-    lesson.original_image_path = str(images[0].path)
+    lesson.original_image_path = str(images[0].path) if images else ""
     session.add_all(
         [
             LessonImage(

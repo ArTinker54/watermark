@@ -356,6 +356,11 @@ class LessonBroadcaster:
 
     async def _send(self, chat_id: int, caption: str | None, images: Sequence[Path]) -> int | None:
         """Отправить пост. Длинный текст уезжает отдельным сообщением."""
+        if not images:
+            # Материал из одного текста: объявление, напоминание. Метку несёт
+            # сам текст, если он достаточно длинный.
+            return await self._send_text(chat_id, caption or "")
+
         inline_caption = caption if caption and len(caption) <= CAPTION_LIMIT else None
 
         if len(images) == 1:
@@ -393,6 +398,24 @@ class LessonBroadcaster:
                 )
 
         return message_id
+
+    async def _send_text(self, chat_id: int, text: str) -> int | None:
+        """Отправить материал без картинок. Возвращает id первого сообщения.
+
+        Режем по лимиту сообщения, а не подписи: картинки тут нет, и подпись
+        ни к чему не привязана.
+        """
+        first: int | None = None
+        for chunk in _split_text(text):
+            message = await self._call(
+                self._bot.send_message,
+                chat_id=chat_id,
+                text=chunk,
+                protect_content=self._protect,
+            )
+            if first is None:
+                first = message.message_id
+        return first
 
     async def _call(self, method: Callable[..., Awaitable[T]], **kwargs: Any) -> T:
         """Вызов Telegram API под общей очередью, с повтором на 429/5xx."""

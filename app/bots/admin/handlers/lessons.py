@@ -71,6 +71,7 @@ async def start_new_lesson(message: Message, state: FSMContext, storage: Storage
     await message.answer(
         "<b>Новый урок</b>\n\n"
         "Пришлите картинку (или несколько) и текст поста.\n\n"
+        "• Можно только текст, без картинок — например объявление.\n"
         "• Текст можно отправить подписью к картинке или отдельным сообщением.\n"
         "• Лучше слать картинки <b>файлом</b>, а не фото: так оригинал "
         "сохранится без пережатия.\n\n"
@@ -118,8 +119,9 @@ async def finish_collecting(
 ) -> None:
     data = await state.get_data()
     images = [Path(item) for item in data.get("images", [])]
-    if not images:
-        await message.answer("Ни одной картинки не прислано — метку некуда вшивать.")
+    caption: str | None = data.get("caption")
+    if not images and not caption:
+        await message.answer("Ни картинок, ни текста — отправлять нечего.")
         return
 
     students = await list_active_students(session)
@@ -129,15 +131,15 @@ async def finish_collecting(
             "Урок можно сохранить, но рассылать некому."
         )
 
-    caption: str | None = data.get("caption")
     await state.set_state(NewLesson.confirming)
 
     await message.answer("<b>Так это увидит ученик:</b>")
-    await message.answer_photo(
-        photo=FSInputFile(images[0]),
-        caption=caption if caption and len(caption) <= CAPTION_LIMIT else None,
-    )
-    if caption and len(caption) > CAPTION_LIMIT:
+    if images:
+        await message.answer_photo(
+            photo=FSInputFile(images[0]),
+            caption=caption if caption and len(caption) <= CAPTION_LIMIT else None,
+        )
+    if caption and (not images or len(caption) > CAPTION_LIMIT):
         for chunk in split_text(caption):
             await message.answer(chunk)
 
@@ -153,12 +155,27 @@ async def finish_collecting(
             f"\nДлинная сторона будет уменьшена до {settings.lesson_max_side} px: "
             "иначе метка не читается со скриншота чата."
         )
-    lines.append("\nКаждый получит свою копию с личной меткой.")
-    if caption:
-        lines.append(
-            "Текст тоже будет помечен." if text_fits(caption)
-            else f"Текст останется без метки: в нём меньше {MIN_GAPS + 1} слов."
-        )
+    marked_text = bool(caption) and text_fits(caption or "")
+    if images:
+        lines.append("\nКаждый получит свою копию с личной меткой.")
+        if caption:
+            lines.append(
+                "Текст тоже будет помечен."
+                if marked_text
+                else f"Текст без метки: в нём меньше {MIN_GAPS + 1} слов. "
+                "Картинку это не затрагивает."
+            )
+    elif marked_text:
+        lines.append("\nМетка будет вшита в текст: каждый получит свою копию.")
+    else:
+        # Без картинок и без длинного текста метки нет вообще. Молчать об этом
+        # нельзя: автор вправе думать, что помечено всё, что уходит через бота.
+        lines += [
+            "",
+            "⚠️ <b>Этот пост уйдёт БЕЗ метки.</b>",
+            f"Картинок нет, а в тексте меньше {MIN_GAPS + 1} слов — вшивать метку некуда.",
+            "Если он утечёт, определить источник будет нельзя.",
+        ]
 
     await message.answer("\n".join(lines), reply_markup=_confirm_keyboard(len(students)))
 
@@ -180,7 +197,7 @@ async def send_lesson(
     data = await state.get_data()
     staged = [Path(item) for item in data.get("images", [])]
     caption: str | None = data.get("caption")
-    if not staged:
+    if not staged and not caption:
         await message.answer("Черновик потерян. Начните заново: /newlesson")
         await state.clear()
         return

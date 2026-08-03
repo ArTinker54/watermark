@@ -54,9 +54,12 @@ async def save_lesson(
     Оригиналы кладутся в ``lessons/<id>/`` БЕЗ метки: именно по ним потом
     выравнивается утёкшая картинка при трассировке. Единственное изменение —
     ограничение длинной стороны, см. :func:`fit_to_max_side`.
+
+    Материал без картинок допустим: объявление из одного текста метку несёт
+    само. А вот пустой материал — нет, отправлять было бы нечего.
     """
-    if not staged:
-        raise ValueError("нет ни одной картинки")
+    if not staged and not caption:
+        raise ValueError("материал без картинок и без текста отправлять нечего")
 
     def materialize(lesson_id: int) -> list[ImageSpec]:
         specs: list[ImageSpec] = []

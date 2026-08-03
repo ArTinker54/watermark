@@ -1184,6 +1184,136 @@ async def test_retyped_text_is_not_attributed(
     assert "метки нет" in result.reason
 
 
+async def test_text_only_lesson_is_delivered_and_traced(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Пост без картинок — тоже материал: метку несёт сам текст."""
+    student = await _register(database, 9930, "Борис")
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=LONG_CAPTION,
+            staged=[],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    assert lesson.images == []
+    assert lesson.original_image_path == ""
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_textonly")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+    assert report.sent == 1
+
+    sent = [item for item in bot.sent if item.chat_id == student.tg_user_id]
+    assert sent and all(item.path is None for item in sent), "картинок быть не должно"
+    assert all(item.protected for item in sent), "защита от пересылки нужна и тексту"
+
+    leaked = sent[0].text or ""
+    assert strip_marks(leaked) == LONG_CAPTION
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace_text(leaked, admin_tg_id=1)
+    assert isinstance(result, TraceHit), getattr(result, "reason", result)
+    assert result.payload == Payload(uid=student.uid, lesson_id=lesson.id)
+
+
+async def test_short_announcement_goes_without_any_mark(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Короткое объявление отправить можно, но пометить его нечем.
+
+    Так выглядит реальный случай: «Всем доброе утро, пишу в боте». Ни картинки,
+    ни достаточного текста — метки нет вообще, и автор должен это понимать.
+    """
+    student = await _register(database, 9931, "Алиса")
+    short = "Всем доброе утро, напоминаю, что пишу в боте, тут всё от меня будет"
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=short,
+            staged=[],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    spec = LessonSpec.of(lesson)
+    assert not spec.text_can_be_marked
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_announce")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(spec, students)
+
+    assert report.sent == 1
+    delivered = next(item.text for item in bot.sent if item.chat_id == student.tg_user_id)
+    assert delivered == short, "текст не должен пострадать"
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace_text(delivered or "", admin_tg_id=1)
+    assert isinstance(result, TraceMiss), "метки там нет и быть не может"
+
+
+async def test_empty_material_is_refused(
+    database, storage: Storage, settings: Settings
+) -> None:
+    """Без картинок и без текста отправлять нечего."""
+    async with database.session_factory() as session:
+        with pytest.raises(ValueError):
+            await save_lesson(
+                session,
+                storage,
+                admin_tg_id=1,
+                caption=None,
+                staged=[],
+                max_side=settings.lesson_max_side,
+            )
+
+
+async def test_long_text_only_lesson_is_split(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings
+) -> None:
+    """Текст длиннее лимита сообщения уходит частями, а не теряется."""
+    student = await _register(database, 9932, "Борис")
+    long_text = " ".join(["слово"] * 1500)  # заведомо больше 4096 символов
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption=long_text,
+            staged=[],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox_long")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    assert report.sent == 1
+    chunks = [item.text or "" for item in bot.sent if item.chat_id == student.tg_user_id]
+    assert len(chunks) > 1, "длинный текст обязан уйти частями"
+    assert all(len(chunk) <= 4096 for chunk in chunks)
+    # Метка вшита циклически, поэтому читается и из отдельного куска.
+    assert extract_text(chunks[0]) == Payload(uid=student.uid, lesson_id=lesson.id)
+
+
 async def test_unrelated_image_is_not_attributed(
     database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
 ) -> None:
