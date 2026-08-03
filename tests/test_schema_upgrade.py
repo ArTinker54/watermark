@@ -8,12 +8,16 @@ create_all добавляет только недостающие таблицы
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from app.config import Settings
 from app.db import create_database
+from app.db.repo import add_course, list_courses
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -87,3 +91,45 @@ async def test_upgrade_is_idempotent(tmp_path: Path) -> None:
         assert names.count("ix_lessons_question_id") == 1
 
     await database.dispose()
+
+
+async def test_two_processes_can_start_at_once(tmp_path: Path) -> None:
+    """Одновременный подъём схемы не должен ронять ни одного из ботов.
+
+    create_all идемпотентен, но не атомарен: проверка существования и CREATE —
+    разные шаги. При перезапуске внахлёст второй процесс падал на «already
+    exists», хотя схему уже создал сосед и работать было можно.
+    """
+    settings = _settings(tmp_path)
+
+    async def boot() -> None:
+        database = create_database(settings)
+        try:
+            await database.create_all()
+            async with database.session_factory() as session:
+                await add_course(session, title="Курс", chat_id=-100500)
+        finally:
+            await database.dispose()
+
+    await asyncio.gather(*(boot() for _ in range(4)))
+
+    database = create_database(settings)
+    try:
+        async with database.session_factory() as session:
+            courses = list(await list_courses(session, only_active=False))
+    finally:
+        await database.dispose()
+
+    assert len(courses) == 1, "курс с тем же чатом обязан остаться один"
+
+
+async def test_broken_schema_still_fails_loudly(tmp_path: Path) -> None:
+    """Проглатывать надо только гонку: испорченная база обязана падать громко."""
+    settings = _settings(tmp_path)
+    database = create_database(settings)
+    try:
+        with pytest.raises(OperationalError):
+            async with database.engine.begin() as connection:
+                await connection.exec_driver_sql("SELECT * FROM таблицы_нет")
+    finally:
+        await database.dispose()

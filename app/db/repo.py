@@ -403,7 +403,17 @@ async def add_course(session: AsyncSession, *, title: str, chat_id: int) -> Cour
 
     course = Course(title=title, chat_id=chat_id)
     session.add(course)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Тот же курс в этот же миг завёл соседний процесс (одновременный старт
+        # заводит группу из настроек). chat_id уникален, значит запись уже есть —
+        # берём её вместо того, чтобы падать.
+        await session.rollback()
+        existing = await get_course_by_chat(session, chat_id)
+        if existing is None:  # pragma: no cover - страховка на неожиданный конфликт
+            raise
+        return existing
     return course
 
 

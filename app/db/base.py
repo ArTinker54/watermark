@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import event
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -20,6 +22,22 @@ from app.config import Settings
 from app.db.models import Base
 
 logger = logging.getLogger(__name__)
+
+#: Сколько раз повторить подъём схемы, если её в этот же миг поднимает сосед.
+_SCHEMA_RETRIES = 3
+
+#: Признаки такой гонки, а не настоящей поломки схемы.
+_RACE_MARKERS = ("ALREADY EXISTS", "DUPLICATE COLUMN", "DATABASE IS LOCKED")
+
+
+def _is_race(exc: Exception) -> bool:
+    """Отличить одновременный старт от настоящей беды со схемой.
+
+    Проглатывать всё подряд нельзя: испорченная база должна падать громко,
+    а не притворяться, что схема готова.
+    """
+    text = str(exc).upper()
+    return any(marker in text for marker in _RACE_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,11 +54,26 @@ class Database:
         существующие он не трогает вовсе. Поэтому колонки, появившиеся после
         первого выпуска, дописываются отдельно — иначе обновлённый код упал бы
         на боевой базе с «no such column».
+
+        Идемпотентность тут не атомарность: проверка существования и CREATE —
+        два разных шага, и при одновременном старте двух процессов (перезапуск
+        внахлёст, второй контейнер) второй падает на «already exists» или
+        «duplicate column». Ронять из-за этого бота нельзя: схему уже создал
+        сосед, и работать можно. Поэтому такие гонки поглощаются с повтором.
         """
-        async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-            await _add_missing_columns(connection)
-        logger.info("схема БД готова")
+        for attempt in range(_SCHEMA_RETRIES):
+            try:
+                async with self.engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                    await _add_missing_columns(connection)
+            except (IntegrityError, OperationalError) as exc:
+                if not _is_race(exc) or attempt == _SCHEMA_RETRIES - 1:
+                    raise
+                logger.warning("схему поднимает соседний процесс, повтор: %s", exc)
+                await asyncio.sleep(0.3 * (attempt + 1))
+                continue
+            logger.info("схема БД готова")
+            return
 
     async def dispose(self) -> None:
         await self.engine.dispose()
