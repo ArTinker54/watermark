@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from contextlib import suppress
 from html import escape as quote
 from pathlib import Path
+from uuid import uuid4
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,6 +28,7 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bots.admin.handlers.drafts import drop_draft
 from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
@@ -132,6 +136,9 @@ async def start_answer(
         await callback.message.answer("Вопрос не найден.")
         return
 
+    # Черновик, начатый до этого, мог остаться от другого сценария: забираем
+    # за ним папку, иначе скачанные картинки останутся на диске навсегда.
+    await drop_draft(state)
     staging = storage.new_staging_dir()
     await state.set_state(AnswerQuestion.collecting)
     await state.set_data(
@@ -141,6 +148,7 @@ async def start_answer(
             "caption": None,
             "question_id": question.id,
             "audience": audience,
+            "draft": uuid4().hex[:8],
         }
     )
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -217,11 +225,13 @@ async def finish_answer(
     if audience != "personal" and courses:
         lines.append("\n<b>Кому отправляем?</b> Получат только участники выбранного курса.")
     await message.answer(
-        "\n".join(lines), reply_markup=_send_keyboard(audience, courses)
+        "\n".join(lines), reply_markup=_send_keyboard(audience, courses, data.get("draft", ""))
     )
 
 
-def _send_keyboard(audience: str, courses: Sequence[Course]) -> InlineKeyboardMarkup:
+def _send_keyboard(
+    audience: str, courses: Sequence[Course], draft: str
+) -> InlineKeyboardMarkup:
     """Кнопки отправки. Для ответа всем — по кнопке на курс.
 
     Курс тут обязателен ровно по той же причине, что и у урока: без него
@@ -231,7 +241,7 @@ def _send_keyboard(audience: str, courses: Sequence[Course]) -> InlineKeyboardMa
     if audience == "personal":
         # Личный ответ адресован тому, кто спросил, и курса не выбирает: право
         # на ответ даёт членство в любом из его курсов.
-        rows = [[InlineKeyboardButton(text="Отправить", callback_data=f"{SEND_ANON}:0")]]
+        rows = [[InlineKeyboardButton(text="Отправить", callback_data=f"{SEND_ANON}:{draft}:0")]]
     elif courses:
         # Имя спросившего показываем не всегда: одним важно, что вопрос их,
         # другим неловко. Поэтому выбор здесь, а не в общей настройке.
@@ -239,7 +249,7 @@ def _send_keyboard(audience: str, courses: Sequence[Course]) -> InlineKeyboardMa
             [
                 InlineKeyboardButton(
                     text=f"С именем: {course.title}",
-                    callback_data=f"{SEND_NAMED}:{course.id}",
+                    callback_data=f"{SEND_NAMED}:{draft}:{course.id}",
                 )
             ]
             for course in courses
@@ -248,15 +258,23 @@ def _send_keyboard(audience: str, courses: Sequence[Course]) -> InlineKeyboardMa
             [
                 InlineKeyboardButton(
                     text=f"Анонимно: {course.title}",
-                    callback_data=f"{SEND_ANON}:{course.id}",
+                    callback_data=f"{SEND_ANON}:{draft}:{course.id}",
                 )
             ]
             for course in courses
         ]
     else:
         rows = [
-            [InlineKeyboardButton(text="Отправить с именем", callback_data=f"{SEND_NAMED}:0")],
-            [InlineKeyboardButton(text="Отправить анонимно", callback_data=f"{SEND_ANON}:0")],
+            [
+                InlineKeyboardButton(
+                    text="Отправить с именем", callback_data=f"{SEND_NAMED}:{draft}:0"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отправить анонимно", callback_data=f"{SEND_ANON}:{draft}:0"
+                )
+            ],
         ]
     rows.append([InlineKeyboardButton(text="Отменить", callback_data=SEND_CANCEL)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -289,6 +307,12 @@ async def send_answer(
         return
 
     data = await state.get_data()
+    raw_action, draft, raw_course = str(callback.data).rsplit(":", 2)
+    if draft != data.get("draft", ""):
+        # Кнопка с прошлого подтверждения: содержимое в состоянии уже другое.
+        await message.answer("Это подтверждение устарело. Соберите ответ заново: /questions")
+        return
+
     staged = [Path(item) for item in data.get("images", [])]
     question = await get_question(session, data["question_id"])
     if question is None:
@@ -296,7 +320,12 @@ async def send_answer(
         await state.clear()
         return
 
-    raw_action, raw_course = str(callback.data).rsplit(":", 1)
+    # Состояние снимается до долгой работы: иначе второе нажатие успевало
+    # пройти тот же фильтр и ответ уходил дважды.
+    await state.set_state(None)
+    with suppress(TelegramBadRequest):
+        await message.edit_reply_markup(reply_markup=None)
+
     course_id = int(raw_course) or None
     course = await get_course(session, course_id) if course_id else None
 
@@ -391,8 +420,4 @@ async def collect_answer_text(message: Message, state: FSMContext) -> None:
 
 
 async def _drop(state: FSMContext) -> None:
-    data = await state.get_data()
-    staging = data.get("staging")
-    if staging:
-        Storage.drop_staging(Path(staging))
-    await state.clear()
+    await drop_draft(state)

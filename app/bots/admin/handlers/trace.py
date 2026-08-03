@@ -11,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
+from app.bots.admin.handlers.drafts import drop_draft
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.db import DeliveryStatus
 from app.services import Storage, TraceHit, TraceMiss, TraceResult, TraceService
@@ -29,6 +30,9 @@ class Trace(StatesGroup):
 
 @router.message(Command("trace"))
 async def start_trace(message: Message, state: FSMContext) -> None:
+    # /trace посреди сборки урока раньше просто затирал состояние, и папка с уже
+    # скачанными картинками оставалась на диске без всякой ссылки на неё.
+    await drop_draft(state)
     await state.set_state(Trace.waiting)
     await message.answer(
         "Пришлите утёкшую картинку, скриншот экрана <b>или скопированный текст</b>.\n\n"

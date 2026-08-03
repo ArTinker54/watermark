@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
+from uuid import uuid4
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,6 +22,7 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bots.admin.handlers.drafts import drop_draft
 from app.bots.admin.handlers.report import format_report
 from app.bots.files import ImageRejected, download_image, extract_file_id
 from app.config import Settings
@@ -58,23 +62,33 @@ class NewLesson(StatesGroup):
     confirming = State()
 
 
-def _confirm_keyboard(courses: Sequence[Course]) -> InlineKeyboardMarkup:
+def _confirm_keyboard(courses: Sequence[Course], draft: str) -> InlineKeyboardMarkup:
     """Кнопка на каждый курс: автор выбирает, чьей аудитории это адресовано.
 
     Без курсов остаётся одна кнопка — материал уйдёт всем зарегистрированным,
     как было до их появления.
+
+    В кнопку зашит идентификатор черновика. Связи между конкретным черновиком и
+    конкретным сообщением подтверждения иначе нет: кнопка на старом сообщении
+    отправила бы свежий, ни к чему не относящийся черновик в чужую аудиторию.
     """
     rows = [
         [
             InlineKeyboardButton(
                 text=f"Разослать: {course.title}",
-                callback_data=f"{SEND_CALLBACK}:{course.id}",
+                callback_data=f"{SEND_CALLBACK}:{draft}:{course.id}",
             )
         ]
         for course in courses
     ]
     if not rows:
-        rows = [[InlineKeyboardButton(text="Разослать всем", callback_data=f"{SEND_CALLBACK}:0")]]
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="Разослать всем", callback_data=f"{SEND_CALLBACK}:{draft}:0"
+                )
+            ]
+        ]
     rows.append([InlineKeyboardButton(text="Отменить", callback_data=CANCEL_CALLBACK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -86,10 +100,15 @@ async def _staged_paths(state: FSMContext) -> list[Path]:
 
 @router.message(Command("newlesson"))
 async def start_new_lesson(message: Message, state: FSMContext, storage: Storage) -> None:
-    await state.clear()
+    # Брошенный черновик убираем с диска: /newlesson поверх начатого сценария
+    # раньше просто терял ссылку на его папку, и скачанные картинки оставались
+    # лежать в staging навсегда.
+    await drop_draft(state)
     staging = storage.new_staging_dir()
     await state.set_state(NewLesson.collecting)
-    await state.set_data({"staging": str(staging), "images": [], "caption": None})
+    await state.set_data(
+        {"staging": str(staging), "images": [], "caption": None, "draft": uuid4().hex[:8]}
+    )
     await message.answer(
         "<b>Новый урок</b>\n\n"
         "Пришлите картинку (или несколько) и текст поста.\n\n"
@@ -230,7 +249,9 @@ async def finish_collecting(
     courses = list(await list_courses(session))
     if courses:
         lines.append("\n<b>Кому отправляем?</b> Получат только участники выбранного курса.")
-    await message.answer("\n".join(lines), reply_markup=_confirm_keyboard(courses))
+    await message.answer(
+        "\n".join(lines), reply_markup=_confirm_keyboard(courses, data.get("draft", ""))
+    )
 
 
 @router.callback_query(NewLesson.confirming, F.data.startswith(f"{SEND_CALLBACK}:"))
@@ -248,6 +269,13 @@ async def send_lesson(
         return
 
     data = await state.get_data()
+    _, draft, raw_course = str(callback.data).rsplit(":", 2)
+    if draft != data.get("draft", ""):
+        # Кнопка с прошлого подтверждения. Содержимое берётся из состояния, а
+        # оно уже другое — отправка ушла бы не тем и не то.
+        await message.answer("Это подтверждение устарело. Соберите материал заново: /newlesson")
+        return
+
     staged = [Path(item) for item in data.get("images", [])]
     caption: str | None = data.get("caption")
     video = await get_uploaded_video(session, data["video_id"]) if data.get("video_id") else None
@@ -256,7 +284,14 @@ async def send_lesson(
         await state.clear()
         return
 
-    course_id = int(str(callback.data).rsplit(":", 1)[-1]) or None
+    # Состояние снимается ДО долгой работы: сохранение урока пережимает все
+    # картинки, и всё это время второе нажатие проходило тот же фильтр —
+    # получалось два урока и две рассылки одного материала.
+    await state.set_state(None)
+    with suppress(TelegramBadRequest):
+        await message.edit_reply_markup(reply_markup=None)
+
+    course_id = int(raw_course) or None
     course = await get_course(session, course_id) if course_id else None
 
     students = await list_active_students(session)
@@ -322,8 +357,4 @@ async def cancel_command(message: Message, state: FSMContext) -> None:
 
 
 async def _cancel(state: FSMContext) -> None:
-    data = await state.get_data()
-    staging = data.get("staging")
-    if staging:
-        Storage.drop_staging(Path(staging))
-    await state.clear()
+    await drop_draft(state)

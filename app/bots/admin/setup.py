@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import BotCommand
 
 from app.bots.admin.handlers import build_router
@@ -40,7 +40,12 @@ def build_admin(
         password_wm=settings.wm_pw_wm,
     )
 
-    dispatcher = Dispatcher(storage=MemoryStorage())
+    # events_isolation: апдейты одного человека обрабатываются по очереди, а не
+    # разом. Без этого альбом ломался — Telegram шлёт каждое фото отдельным
+    # апдейтом, обработчики читали состояние одновременно, вычисляли один и тот
+    # же номер картинки и писали все фото в один файл. Двойное нажатие
+    # «Разослать» точно так же успевало пройти дважды.
+    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dispatcher["settings"] = settings
     dispatcher["storage"] = storage
     dispatcher["broadcaster"] = LessonBroadcaster(

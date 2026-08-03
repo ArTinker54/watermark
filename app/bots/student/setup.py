@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import BotCommand
 
 from app.bots.middlewares import DbSessionMiddleware
@@ -38,7 +39,9 @@ def build_student(
     owns_session = bot is None
     bot = bot or make_bot(settings.student_bot_token)
 
-    dispatcher = Dispatcher()
+    # По той же причине, что и в админке: апдейты одного человека — по очереди.
+    # Здесь это защищает вопрос с картинкой и двойное нажатие «Принимаю».
+    dispatcher = Dispatcher(events_isolation=SimpleEventIsolation())
     dispatcher["settings"] = settings
     dispatcher["storage"] = Storage(root=settings.storage_path)
     dispatcher["admin_notifier"] = admin_notifier
