@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from html import escape
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
@@ -29,8 +31,54 @@ router = Router(name="recipients")
 
 #: Сколько материалов показывать в сводке.
 _RECENT = 10
-#: Сколько имён показывать в списке, чтобы не упереться в лимит сообщения.
-_NAMES = 40
+#: Порог, после которого список уезжает в следующее сообщение. С запасом от 4096:
+#: строку никогда не рвём пополам, поэтому последняя может вылезти за границу.
+_CHUNK = 3500
+
+
+def named(student: Student) -> str:
+    """Строка списка: номер и имя, безопасные для разметки.
+
+    Имя приходит из Telegram и содержит что угодно, включая ``&`` и ``<``. В
+    режиме HTML такой символ ломает разбор — и Telegram отвергает всё сообщение
+    целиком, а не одну строку. То есть один человек с амперсандом в имени делал
+    бы недоступным весь список.
+    """
+    return f"• {student.uid_str} — {escape(student.display_name)}"
+
+
+def pack(lines: Sequence[str], limit: int = _CHUNK) -> list[str]:
+    """Разложить строки по сообщениям, не разрывая строку пополам."""
+    messages: list[str] = []
+    batch: list[str] = []
+    size = 0
+    for line in lines:
+        if batch and size + len(line) + 1 > limit:
+            messages.append("\n".join(batch))
+            batch, size = [], 0
+        batch.append(line)
+        size += len(line) + 1
+    if batch:
+        messages.append("\n".join(batch))
+    return messages or [""]
+
+
+async def send_lines(
+    message: Message, lines: Sequence[str], *, edit: Message | None = None
+) -> None:
+    """Показать список целиком: сколько бы ни было имён, ничего не теряем.
+
+    Раньше список обрезался на сороковом имени, а остаток заменялся на «…и ещё
+    N». При сотне учеников это означало, что найти конкретного человека в выдаче
+    невозможно — ровно то, ради чего команда и нужна.
+    """
+    parts = pack(lines)
+    if edit is not None:
+        await edit.edit_text(parts[0])
+    else:
+        await message.answer(parts[0])
+    for part in parts[1:]:
+        await message.answer(part)
 
 
 @router.message(Command("recipients"))
@@ -108,16 +156,14 @@ async def show_recipients(
     if orphans:
         lines.append(f"\n<b>Ни в одном курсе ({len(orphans)}):</b>")
         lines.append("Зарегистрированы, но материалы им больше не уходят.")
-        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in orphans[:_NAMES])
-        if len(orphans) > _NAMES:
-            lines.append(f"…и ещё {len(orphans) - _NAMES}")
+        lines.extend(named(s) for s in orphans)
 
     if not any(inside.values()) and len(students) > 1 and not broken:
         lines.append(
             "\n⚠️ Не прошёл никто ни по одному курсу. Похоже на сбой настройки: "
             "проверьте, что бот рассылки — администратор во всех чатах курсов."
         )
-    await status.edit_text("\n".join(lines))
+    await send_lines(message, lines, edit=status)
 
 
 async def _without_courses(
@@ -146,8 +192,8 @@ async def _without_courses(
     lines = [f"<b>Получателей: {len(inside)}</b>", f"Принято условий: {len(students)}"]
     if outside:
         lines.append(f"\n<b>Не получат — нет в группе ({len(outside)}):</b>")
-        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in outside[:_NAMES])
-    await status.edit_text("\n".join(lines))
+        lines.extend(named(s) for s in outside)
+    await send_lines(message, lines, edit=status)
 
 
 @router.message(Command("course"))
@@ -196,15 +242,11 @@ async def show_course_audience(
     ]
     if inside:
         lines.append(f"<b>В курсе ({len(inside)}):</b>")
-        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in inside[:_NAMES])
-        if len(inside) > _NAMES:
-            lines.append(f"…и ещё {len(inside) - _NAMES}")
+        lines.extend(named(s) for s in inside)
     if outside:
         lines.append(f"\n<b>Не в курсе ({len(outside)}):</b>")
-        lines.extend(f"• {s.uid_str} — {s.display_name}" for s in outside[:_NAMES])
-        if len(outside) > _NAMES:
-            lines.append(f"…и ещё {len(outside) - _NAMES}")
-    await status.edit_text("\n".join(lines))
+        lines.extend(named(s) for s in outside)
+    await send_lines(message, lines, edit=status)
 
 
 @router.message(Command("lessons"))
@@ -251,7 +293,7 @@ async def show_lesson(message: Message, command: CommandObject, session: AsyncSe
 
     groups: dict[DeliveryStatus, list[str]] = {status: [] for status in DeliveryStatus}
     for delivery, student in rows:
-        groups[delivery.status].append(f"• {student.uid_str} — {student.display_name}")
+        groups[delivery.status].append(named(student))
 
     lines = [
         f"<b>{lesson.title}</b> · {format_dt(lesson.created_at)}",
@@ -268,7 +310,5 @@ async def show_lesson(message: Message, command: CommandObject, session: AsyncSe
         if not names:
             continue
         lines.append(f"\n<b>{title} ({len(names)}):</b>")
-        lines.extend(names[:_NAMES])
-        if len(names) > _NAMES:
-            lines.append(f"…и ещё {len(names) - _NAMES}")
-    await message.answer("\n".join(lines))
+        lines.extend(names)
+    await send_lines(message, lines)
