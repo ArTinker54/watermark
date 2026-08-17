@@ -12,6 +12,7 @@ import pytest
 
 from app.watermark.payload import WM_BIT_LENGTH, Payload
 from app.watermark.verify import (
+    MAX_NOISE_BITS,
     MIN_MARGIN,
     SoftRead,
     bits_of,
@@ -19,6 +20,7 @@ from app.watermark.verify import (
     kmeans_threshold,
     match,
     near_misses,
+    varying_positions,
 )
 
 #: Выданные копии одного урока — как в жизни, подряд идущие номера.
@@ -153,3 +155,88 @@ def test_vidno_naskolko_otstala_sleduyuschaya_kopiya() -> None:
     assert verdict.mismatched == 0
     assert verdict.runner_up_mismatched is not None
     assert verdict.runner_up_mismatched >= 1
+
+
+#: Номера как в бою: выдача идёт не подряд, часть участников отсеивается.
+WIDE = [Payload(uid=uid, lesson_id=143).encode() for uid in (*range(1, 100), *range(150, 202))]
+WIDE_TRUTH = Payload(uid=195, lesson_id=143).encode()
+
+
+def key_bits() -> tuple[int, ...]:
+    return varying_positions([bits_of(item) for item in WIDE])
+
+
+def flipped(payload: str, *positions: int) -> SoftRead:
+    """Чтение метки с перевёрнутыми битами в указанных позициях."""
+    bits = list(bits_of(payload))
+    for index in positions:
+        bits[index] = not bits[index]
+    values = tuple(0.5 + (0.4 if bit else -0.4) for bit in bits)
+    return SoftRead(values=values, threshold=kmeans_threshold(values))
+
+
+def test_metku_razlichayut_edinicy_bit() -> None:
+    """Опознающих бит мало — и это причина всего остального в этом файле.
+
+    В ``V|uid|lesson`` совпадает почти всё: буква, разделители, номер урока и
+    старшие половины цифр номера. На полутора сотнях участников людей различают
+    девять бит из 95.
+    """
+    assert len(key_bits()) < 15, "опознающих бит должно быть заметно меньше длины метки"
+
+
+def test_sboy_v_razdelitele_ne_meshaet_nazvat_cheloveka() -> None:
+    """Боевой случай: прочиталось ``V|0195x00143`` — сбой в разделителе.
+
+    Этот бит одинаков у всех выданных копий, перепутать по нему никого нельзя.
+    Раньше проверка требовала совпадения по всем 95 битам и отказывалась
+    называть участника из-за помехи, которая ни на что не влияет.
+    """
+    separator = next(index for index in range(95) if index not in key_bits() and index > 40)
+
+    verdict = match(flipped(WIDE_TRUTH, separator), WIDE)
+
+    assert verdict is not None
+    assert verdict.payload == WIDE_TRUTH
+    assert verdict.mismatched == 1, "один бит всё же разошёлся"
+    assert verdict.mismatched_key == 0, "но опознающие биты прочитаны верно"
+    assert verdict.trustworthy
+
+
+def test_sboy_v_opoznayuschem_bite_po_prezhnemu_zapreschaet_imya() -> None:
+    """Главная защита не должна ослабнуть: сбой в опознающем бите — это отказ.
+
+    Именно так метка превращается в соседскую, и именно поэтому нельзя просто
+    разрешить «почти совпало».
+    """
+    verdict = match(flipped(WIDE_TRUTH, key_bits()[3]), WIDE)
+
+    assert verdict is not None
+    assert verdict.payload != WIDE_TRUTH, "победила чужая метка — так и бывает"
+    assert verdict.mismatched_key == 1
+    assert not verdict.trustworthy
+
+
+def test_shumnoe_chtenie_ne_daet_imeni_dazhe_pri_vernyh_opoznayuschih() -> None:
+    """Много помех — значит чтению нельзя верить целиком.
+
+    Опознающих бит девять, случайный мусор попадает в чью-то комбинацию
+    примерно в одном случае из пяти. Поэтому совпадения по ним мало: нужен
+    признак, что читали настоящую метку.
+    """
+    noise = [index for index in range(95) if index not in key_bits()][:6]
+
+    verdict = match(flipped(WIDE_TRUTH, *noise), WIDE)
+
+    assert verdict is not None
+    assert verdict.mismatched_key == 0
+    assert verdict.mismatched > MAX_NOISE_BITS
+    assert not verdict.trustworthy
+
+
+def test_chistoe_chtenie_nazyvaet_cheloveka() -> None:
+    """Проверка на то, что послабление не сломало обычный путь."""
+    verdict = match(flipped(WIDE_TRUTH), WIDE)
+
+    assert verdict is not None and verdict.trustworthy
+    assert verdict.payload == WIDE_TRUTH

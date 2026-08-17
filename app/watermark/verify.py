@@ -50,6 +50,19 @@ MIN_MARGIN: Final[float] = 0.20
 #: подменяется бесполезным «метка повреждена» на любой посторонней картинке.
 MAX_DAMAGED_BITS: Final[int] = 8
 
+#: Сколько помех в НЕопознающих битах ещё позволяет называть человека.
+#:
+#: Опознающих бит мало — на сотне участников девять из 95. Значит случайный
+#: мусор попадает в чью-то комбинацию этих девяти примерно в одном случае из
+#: пяти, и одного лишь совпадения по ним мало: нужен признак, что читали
+#: настоящую метку, а не шум. Им и служит общее число расхождений — у мусора
+#: оно около 47, у настоящей метки с единичной помехой единицы.
+#:
+#: Четыре, а не восемь: чем больше помех всего, тем вероятнее, что одна из них
+#: села на опознающий бит и метка стала соседской. При четырёх на опознающие
+#: биты приходится в среднем 0.4 ошибки, при восьми уже 0.8.
+MAX_NOISE_BITS: Final[int] = 4
+
 
 @dataclass(frozen=True, slots=True)
 class SoftRead:
@@ -99,18 +112,41 @@ class Verdict:
     чтобы ответ поменялся на другого человека.
     """
 
+    mismatched_key: int
+    """Сколько разошлось среди бит, которыми копии вообще отличаются друг от друга.
+
+    Именно это число решает, кто перед нами. В метке ``V|uid|lesson`` почти всё
+    одинаково у всех получателей одного урока: буква, разделители, номер урока
+    и даже старшие половины цифр номера. На сотне участников из 95 бит людей
+    различают девять — остальные 86 у всех совпадают.
+
+    Сбой в этих 86 битах не может превратить одного участника в другого: там не
+    записано, кто это. Считать его наравне с остальными — значит отказываться
+    называть человека из-за помехи, которая ни на что не влияет.
+    """
+
     weakest_bit: float
 
     @property
     def trustworthy(self) -> bool:
         """Можно ли называть человека.
 
-        Два условия: прочитано ровно то, что выдавали, и следующий кандидат
-        заметно хуже. Второе и есть защита от одиночного сбоя — отрыв равен
-        удвоенной уверенности того бита, по которому расходятся победитель и
-        ближайшая чужая метка.
+        Три условия. Первое: опознающие биты прочитаны без единой ошибки — на
+        них и держится ответ. Второе: следующий кандидат заметно хуже; это
+        защита от одиночного сбоя в опознающем бите, из-за которого метка
+        становится соседской. Третье: помех в остальных битах немного, иначе
+        чтение шумное целиком и верить его опознающим битам не за что.
+
+        Раньше первое условие требовало совпадения по ВСЕМ битам. На боевой
+        трассировке это стоило имени: метка прочиталась как ``V|0195x00143``,
+        то есть с единственным сбоем в разделителе — бите, одинаковом у всех
+        106 выданных копий. Все девять опознающих бит при этом были верны.
         """
-        return self.mismatched == 0 and self.margin >= MIN_MARGIN
+        return (
+            self.mismatched_key == 0
+            and self.mismatched <= MAX_NOISE_BITS
+            and self.margin >= MIN_MARGIN
+        )
 
     @property
     def plausible(self) -> bool:
@@ -148,6 +184,22 @@ def kmeans_threshold(values: Sequence[float]) -> float:
     return threshold
 
 
+def varying_positions(payloads: Sequence[tuple[bool, ...]]) -> tuple[int, ...]:
+    """Позиции бит, которыми выданные копии вообще отличаются друг от друга.
+
+    Всё остальное — буква, разделители, номер урока, старшие половины цифр —
+    у получателей одного урока совпадает и потому никого ни с кем перепутать
+    не может.
+    """
+    if not payloads:
+        return ()
+    return tuple(
+        index
+        for index in range(len(payloads[0]))
+        if len({bits[index] for bits in payloads}) > 1
+    )
+
+
 def bits_of(payload: str) -> tuple[bool, ...]:
     """Биты метки в том же порядке, в каком их вшивает библиотека."""
     return tuple(char == "1" for char in bin(int(payload.encode("utf-8").hex(), base=16))[2:])
@@ -175,22 +227,34 @@ def match(read: SoftRead, issued: Iterable[str]) -> Verdict | None:
     ``None`` — сверять не с чем: ни одна выданная метка не подошла по длине.
     """
     centred = [value - read.threshold for value in read.values]
-    scored: list[tuple[float, int, str]] = []
-    for payload in dict.fromkeys(issued):  # без повторов, порядок сохраняется
-        bits = bits_of(payload)
-        if len(bits) != len(centred):
-            continue
+    candidates = [
+        (payload, bits_of(payload))
+        for payload in dict.fromkeys(issued)  # без повторов, порядок сохраняется
+    ]
+    candidates = [item for item in candidates if len(item[1]) == len(centred)]
+    # Опознающие биты считаются по всему списку выданных копий, а не по одной:
+    # «различает» — это свойство набора, а не отдельной метки.
+    key_positions = varying_positions([bits for _, bits in candidates])
+
+    scored: list[tuple[float, int, int, str]] = []
+    for payload, bits in candidates:
         score = sum(
             offset if bit else -offset for bit, offset in zip(bits, centred, strict=True)
         )
-        mismatched = sum((offset > 0) != bit for bit, offset in zip(bits, centred, strict=True))
-        scored.append((score, mismatched, payload))
+        wrong = [
+            index
+            for index, (bit, offset) in enumerate(zip(bits, centred, strict=True))
+            if (offset > 0) != bit
+        ]
+        mismatched = len(wrong)
+        mismatched_key = sum(1 for index in wrong if index in set(key_positions))
+        scored.append((score, mismatched, mismatched_key, payload))
 
     if not scored:
         return None
 
-    scored.sort(key=lambda item: (-item[0], item[2]))
-    score, mismatched, payload = scored[0]
+    scored.sort(key=lambda item: (-item[0], item[3]))
+    score, mismatched, mismatched_key, payload = scored[0]
     runner_up = scored[1] if len(scored) > 1 else None
 
     # Отрыв нормируется на удвоенный разброс: две метки, различающиеся одним
@@ -204,8 +268,9 @@ def match(read: SoftRead, issued: Iterable[str]) -> Verdict | None:
         payload=payload,
         mismatched=mismatched,
         margin=margin,
-        runner_up=runner_up[2] if runner_up else None,
+        runner_up=runner_up[3] if runner_up else None,
         runner_up_mismatched=runner_up[1] if runner_up else None,
+        mismatched_key=mismatched_key,
         weakest_bit=read.weakest_bit,
     )
 
