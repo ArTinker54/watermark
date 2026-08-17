@@ -10,6 +10,7 @@ from app.bots.admin.handlers import (
     lessons,
     questions,
     recipients,
+    selfcheck,
     stats,
     trace,
 )
@@ -30,6 +31,7 @@ def build_router() -> Router:
     router.include_router(trace.router)
     router.include_router(stats.router)
     router.include_router(drafts.router)
+    router.include_router(selfcheck.router)
     return router
 
 

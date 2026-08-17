@@ -26,6 +26,7 @@ COMMANDS = [
     BotCommand(command="recipients", description="Кто что получит по курсам"),
     BotCommand(command="lessons", description="Материалы и число получателей"),
     BotCommand(command="trace", description="Найти источник утечки"),
+    BotCommand(command="selftest", description="Проверить метку на боевых копиях"),
     BotCommand(command="stats", description="Статистика"),
     BotCommand(command="cancel", description="Прервать сценарий"),
 ]
@@ -48,6 +49,7 @@ def build_admin(
     dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dispatcher["settings"] = settings
     dispatcher["storage"] = storage
+    dispatcher["engine"] = engine
     dispatcher["broadcaster"] = LessonBroadcaster(
         bot=student_bot,
         engine=engine,

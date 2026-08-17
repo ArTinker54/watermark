@@ -123,7 +123,17 @@ def _format_miss(miss: TraceMiss) -> str:
         share = f" — {miss.scale:.0%} от оригинала {whole}" if miss.scale else ""
         lines.append(f"Область урока: {found}{share}")
     if miss.best_confidence is not None:
-        lines.append(f"Похожесть: {miss.best_confidence:.2f}")
+        # Четыре знака, а не два: у самого оригинала здесь ровно 1.0000, а у
+        # выданной копии около 0.998 — метка меняет пиксели. С округлением до
+        # сотых оба случая печатались как «1.00», и отличить исходник от копии
+        # ученика по ответу было нельзя. Ровно в этом и был вопрос.
+        lines.append(f"Похожесть: {miss.best_confidence:.4f}")
+        if miss.best_confidence >= 0.9999:
+            lines.append(
+                "Это в точности оригинал, а не выданная копия: метку в него "
+                "не вшивали, и прочитать её нельзя. Нужен файл из личной "
+                "переписки ученика."
+            )
     lines.append(f"Проверено оригиналов: {miss.checked}")
     return "\n".join(lines)
 
