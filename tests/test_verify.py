@@ -122,3 +122,34 @@ def test_near_misses_lists_the_plausible_candidates() -> None:
 @pytest.mark.parametrize("payload", [TRUTH, Payload(uid=1, lesson_id=99999).encode()])
 def test_bits_length_matches_the_mark(payload: str) -> None:
     assert len(bits_of(payload)) == WM_BIT_LENGTH
+
+
+def test_vydannye_metki_lezhat_vplotnuyu_drug_k_drugu() -> None:
+    """Свойство формата, из которого следует всё остальное в этом файле.
+
+    ``V|uid|lesson`` не разносит номера по битам: соседние uid отличаются
+    одним-двумя битами. Отсюда и запрет называть человека по неточному
+    совпадению — ошибка чтения в пару бит превращает метку в соседскую.
+    """
+    distances = sorted(
+        sum(x != y for x, y in zip(bits_of(a), bits_of(b), strict=True))
+        for index, a in enumerate(ISSUED)
+        for b in ISSUED[index + 1 :]
+    )
+
+    assert distances[0] == 1, "нашлись метки, различающиеся одним битом"
+    assert distances[len(distances) // 2] <= 6, "медиана расстояния мала"
+
+
+def test_vidno_naskolko_otstala_sleduyuschaya_kopiya() -> None:
+    """Расстояние до второго места — это цена ошибки чтения, и её надо показать.
+
+    Без неё «ближайшая разошлась на 8 бит» звучит как «почти нашли», хотя рядом
+    стоит толпа таких же почти совпавших.
+    """
+    verdict = match(read_of(TRUTH), ISSUED)
+
+    assert verdict is not None
+    assert verdict.mismatched == 0
+    assert verdict.runner_up_mismatched is not None
+    assert verdict.runner_up_mismatched >= 1

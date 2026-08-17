@@ -30,8 +30,8 @@ def build_router() -> Router:
     router.include_router(recipients.router)
     router.include_router(trace.router)
     router.include_router(stats.router)
-    router.include_router(drafts.router)
     router.include_router(selfcheck.router)
+    router.include_router(drafts.router)
     return router
 
 

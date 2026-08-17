@@ -91,6 +91,14 @@ class Verdict:
     """Отрыв от второго места в долях уверенности одного бита."""
 
     runner_up: str | None
+    runner_up_mismatched: int | None
+    """На сколько бит разошлось со ВТОРОЙ по близости копией.
+
+    Вместе с ``mismatched`` это и есть цена ошибки чтения: если ближайшая
+    разошлась на 8 бит, а следующая на 9, то одного лишнего сбоя хватило бы,
+    чтобы ответ поменялся на другого человека.
+    """
+
     weakest_bit: float
 
     @property
@@ -197,6 +205,7 @@ def match(read: SoftRead, issued: Iterable[str]) -> Verdict | None:
         mismatched=mismatched,
         margin=margin,
         runner_up=runner_up[2] if runner_up else None,
+        runner_up_mismatched=runner_up[1] if runner_up else None,
         weakest_bit=read.weakest_bit,
     )
 
@@ -224,3 +233,4 @@ def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 3) -> lis
     # иначе настоящий владелец вылетает из короткого списка из-за своего номера.
     close.sort()
     return [payload for _, _, payload in close[:limit]]
+

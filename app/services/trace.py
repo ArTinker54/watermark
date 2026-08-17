@@ -169,6 +169,16 @@ def _damaged_note(read: SoftRead, issued: Sequence[str], verdict: Verdict) -> st
             f"метка повреждена: из {len(issued)} выданных копий ни одна не совпала "
             f"точно, ближайшая разошлась на {verdict.mismatched} бит"
         )
+        # Расстояние до второго места — это и есть цена ошибки чтения. Метки
+        # выдаются подряд идущим номерам и лежат вплотную: соседние отличаются
+        # одним-двумя битами. Поэтому «почти совпала» здесь не значит «почти
+        # нашли» — рядом стоит толпа таких же почти совпавших.
+        if verdict.runner_up_mismatched is not None:
+            head += (
+                f", следующая — на {verdict.runner_up_mismatched}. Выданные метки "
+                "лежат вплотную друг к другу, так что выбор между ними был бы "
+                "жребием"
+            )
     else:
         head = (
             "метка совпала с выданной копией, но соседняя выданная метка почти "
@@ -217,6 +227,7 @@ class TraceService:
 
         # Проход 1 — урок целиком виден на присланной картинке (скриншот).
         candidates = await self._rank(suspect, pairs)
+        tried: list[_Candidate] = []
         for candidate in candidates[: self._max_candidates]:
             attempt = await self._try_candidate(suspect, candidate)
             if attempt is None:
@@ -225,12 +236,38 @@ class TraceService:
                 await self._log(admin_tg_id, suspect_path, attempt.hit)
                 return attempt.hit
             attempts.append(attempt)
+            tried.append(candidate)
 
         # Проход 2 — от урока отрезали часть. Тогда прямой поиск бесполезен:
         # шаблона целиком на картинке нет. Ищем наоборот — обрезок внутри
         # оригинала — и восстанавливаем геометрию.
-        for candidate in await self._rank_fragments(suspect, pairs):
-            attempt = await self._try_fragment(suspect, candidate)
+        fragments = await self._rank_fragments(suspect, pairs)
+        for candidate in fragments:
+            attempt = await self._try_fragment(suspect, candidate, hint=candidate.coarse)
+            if attempt is None:
+                continue
+            if attempt.hit is not None:
+                await self._log(admin_tg_id, suspect_path, attempt.hit)
+                return attempt.hit
+            attempts.append(attempt)
+
+        # Проход 3 — добить уроки, которые опознал первый проход.
+        #
+        # Ранжирования у проходов независимые и меряют разное: первый ищет урок
+        # на картинке, второй — картинку внутри урока. Урок, уверенно опознанный
+        # первым, во вторую тройку попасть не обязан, и тогда сборка из обрезка
+        # к нему просто не применяется.
+        #
+        # Стоило это дорого. Обрезанный по краям скриншот давал в первом проходе
+        # «метка повреждена, разошлась на 8 бит» — то есть след есть, а имени
+        # нет, — хотя сборка из обрезка читает такую метку начисто. Подсказку
+        # первого прохода тут не передаём: она про другой поиск, и окно вокруг
+        # неё увело бы второй в сторону.
+        done = {(item.lesson.id, item.image.id) for item in fragments}
+        for candidate in tried:
+            if (candidate.lesson.id, candidate.image.id) in done:
+                continue
+            attempt = await self._try_fragment(suspect, candidate, hint=None)
             if attempt is None:
                 continue
             if attempt.hit is not None:
@@ -443,9 +480,17 @@ class TraceService:
         )
         return _Reading(raw=raw, damaged=_damaged_note(read, issued, verdict))
 
-    async def _try_fragment(self, suspect: BgrImage, candidate: _Candidate) -> _Attempt | None:
+    async def _try_fragment(
+        self, suspect: BgrImage, candidate: _Candidate, *, hint: CoarseMatch | None
+    ) -> _Attempt | None:
+        """``hint`` — подсказка ОБРАТНОГО поиска (обрезок внутри оригинала).
+
+        Подсказку прямого прохода сюда передавать нельзя: там масштаб меряется
+        в другую сторону, и окно вокруг неё увело бы поиск в сторону. Для таких
+        кандидатов ``None`` — обратный грубый проход посчитается заново.
+        """
         original = Path(candidate.image.path)
-        rebuilt = await rebuild_fragment_async(suspect, original, hint=candidate.coarse)
+        rebuilt = await rebuild_fragment_async(suspect, original, hint=hint)
         if rebuilt is None:
             return None
 

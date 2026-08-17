@@ -1771,3 +1771,78 @@ async def test_answer_still_skips_someone_who_left_every_course(
 
     assert report.sent == 0
     assert len(report.skipped) == 1
+
+
+async def test_trace_obrezannogo_uvelichennogo_skrinshota(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Скриншот увеличили и обрезали по краям — участника всё равно надо назвать.
+
+    Пришло из жизни, и это худший из «мягких» случаев. Обрезка сдвигает сетку
+    блоков, поэтому прямой проход читает метку с ошибкой в несколько бит: след
+    виден, а имени нет. Сборка из обрезка такую метку читает начисто — но
+    применялась не всегда.
+
+    Причина была в том, что проходы ранжируют кандидатов независимо и меряют
+    разное: первый ищет урок на картинке, второй — картинку внутри урока. Урок,
+    уверенно опознанный первым, во вторую тройку попасть не обязан, и сборка к
+    нему просто не применялась. Ответ выглядел как «метка повреждена,
+    разошлась на 8 бит. Назвать участника нельзя».
+    """
+    await _register(database, 6001, "Анна")
+    borya = await _register(database, 6002, "Борис")
+
+    async with database.session_factory() as session:
+        # Соседние уроки нужны, чтобы выбор кандидата был настоящим: на одном
+        # уроке любой перебор попадает в цель, а в бою их под сотню.
+        for seed in range(8):
+            decoy = settings.storage_path / f"decoy_{seed}.png"
+            decoy.parent.mkdir(parents=True, exist_ok=True)
+            make_chart(width=800, height=520, seed=100 + seed).save(decoy)
+            await save_lesson(
+                session,
+                storage,
+                admin_tg_id=1,
+                caption=f"Соседний урок {seed}",
+                staged=[decoy],
+                max_side=settings.lesson_max_side,
+            )
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption="Урок с обзором",
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+    assert report.sent == 2
+
+    with Image.open(bot.delivered_to(borya.tg_user_id)[0]) as delivered:
+        # Экран с масштабированием отдаёт картинку крупнее оригинала...
+        big = delivered.convert("RGB").resize(
+            (round(delivered.width * 1.25), round(delivered.height * 1.25)),
+            Image.Resampling.LANCZOS,
+        )
+        # ...а человек вырезает из снимка сам график и срезает края.
+        cut = 8
+        piece = big.crop((cut, cut, big.width - cut, big.height - cut))
+
+    leak = settings.storage_path / "leak_crop.png"
+    jpeg(piece, 90).save(leak)
+
+    tracer = TraceService(
+        engine=engine,
+        session_factory=database.session_factory,
+        min_confidence=settings.trace_min_confidence,
+    )
+    result = await tracer.trace(leak, admin_tg_id=1)
+
+    assert isinstance(result, TraceHit), getattr(result, "reason", result)
+    assert result.payload == Payload(uid=borya.uid, lesson_id=lesson.id)
+    assert result.student is not None and result.student.tg_user_id == borya.tg_user_id
