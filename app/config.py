@@ -95,7 +95,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
 
     @field_validator(
-        "vsa_group_id", "db_path", "storage_path", "offer_path", mode="before"
+        "vsa_group_id",
+        "selfcheck_lesson",
+        "db_path",
+        "storage_path",
+        "offer_path",
+        mode="before",
     )
     @classmethod
     def _blank_means_default(cls, value: Any, info: ValidationInfo) -> Any:

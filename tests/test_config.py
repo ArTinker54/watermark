@@ -21,9 +21,16 @@ def _settings(**overrides: object) -> Settings:
 
 
 @pytest.mark.parametrize("raw", ["", "   "])
-def test_blank_optional_means_disabled(raw: str) -> None:
-    """``VSA_GROUP_ID=`` — это выключенная проверка, а не ошибка конфига."""
-    assert _settings(vsa_group_id=raw).vsa_group_id is None
+@pytest.mark.parametrize("field", ["vsa_group_id", "selfcheck_lesson"])
+def test_blank_optional_means_disabled(field: str, raw: str) -> None:
+    """``VSA_GROUP_ID=`` — это выключенная проверка, а не ошибка конфига.
+
+    Перебор по всем необязательным числовым полям намеренно: выключают их
+    именно так — стирают значение, оставив имя. Новое поле легко забыть внести
+    в валидатор, и тогда пустая строка уронит запуск. Ровно это и случилось с
+    ``SELFCHECK_LESSON``: попытка выключить проверку положила бы обоих ботов.
+    """
+    assert getattr(_settings(**{field: raw}), field) is None
 
 
 @pytest.mark.parametrize("field", ["db_path", "storage_path", "offer_path"])
