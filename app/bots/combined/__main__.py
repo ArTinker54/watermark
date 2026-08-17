@@ -17,12 +17,38 @@ import logging
 from app.bots.admin.setup import build_admin
 from app.bots.runtime import make_bot, migrate_group_to_course, run_bots
 from app.bots.student.setup import build_student
-from app.config import get_settings
-from app.db import create_database
+from app.config import Settings, get_settings
+from app.db import Database, create_database
 from app.logging_setup import setup_logging
-from app.watermark import WM_BIT_LENGTH
+from app.services import Storage
+from app.services.selfcheck import check
+from app.watermark import WM_BIT_LENGTH, WatermarkEngine
 
 logger = logging.getLogger(__name__)
+
+
+async def selfcheck(settings: Settings, database: Database) -> None:
+    """Проверить метку на боевых копиях и написать результат в логи.
+
+    Включается переменной SELFCHECK_LESSON. Нужно потому, что в контейнер на
+    Railway не зайти: SSH туда не отвечает, а том с оригиналами и выданными
+    копиями существует только внутри. Логи при этом читаются снаружи — значит
+    через них можно и спросить, и получить ответ.
+    """
+    if settings.selfcheck_lesson is None:
+        return
+    engine = WatermarkEngine(
+        password_img=settings.wm_pw_img, password_wm=settings.wm_pw_wm
+    )
+    storage = Storage(root=settings.storage_path)
+    async with database.session_factory() as session:
+        try:
+            lines = await check(session, storage, engine, settings.selfcheck_lesson)
+        except Exception:
+            logger.exception("самопроверка метки сорвалась")
+            return
+    for line in lines:
+        logger.info("САМОПРОВЕРКА: %s", line)
 
 
 async def main() -> None:
@@ -36,6 +62,7 @@ async def main() -> None:
     database = create_database(settings)
     await database.create_all()
     await migrate_group_to_course(database, settings)
+    await selfcheck(settings, database)
 
     # По одному объекту Bot на токен: student-бот и принимает /start, и
     # рассылает уроки; admin-бот и общается с автором, и шлёт ему уведомления

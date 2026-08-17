@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.bots.admin.handlers.selfcheck import _uid_from_name
 from app.services import Storage
+from app.services.selfcheck import uid_from_name
 from app.watermark.engine import EMBED_VERSION
 
 
@@ -21,7 +21,7 @@ def test_imya_kopii_razbiraetsya_obratno(tmp_path: Path) -> None:
 
     path = storage.marked(lesson_id=141, uid=42, position=0)
 
-    assert _uid_from_name(path) == 42
+    assert uid_from_name(path) == 42
 
 
 def test_shablon_poiska_nahodit_kopii(tmp_path: Path) -> None:
@@ -33,7 +33,7 @@ def test_shablon_poiska_nahodit_kopii(tmp_path: Path) -> None:
 
     found = sorted(folder.glob(f"*_v{EMBED_VERSION}.png"))
 
-    assert [_uid_from_name(item) for item in found] == [1, 42, 1234]
+    assert [uid_from_name(item) for item in found] == [1, 42, 1234]
 
 
 def test_kopiya_proshloy_versii_ne_schitaetsya_svezhey(tmp_path: Path) -> None:
@@ -50,9 +50,9 @@ def test_kopiya_proshloy_versii_ne_schitaetsya_svezhey(tmp_path: Path) -> None:
 
     found = sorted(folder.glob(f"*_v{EMBED_VERSION}.png"))
 
-    assert [_uid_from_name(item) for item in found] == [7]
+    assert [uid_from_name(item) for item in found] == [7]
 
 
 def test_chuzhoe_imya_ne_ronyaet_razbor(tmp_path: Path) -> None:
     """В папке может лежать что угодно — это не повод падать."""
-    assert _uid_from_name(Path("мусор.png")) is None
+    assert uid_from_name(Path("мусор.png")) is None
