@@ -15,11 +15,17 @@ from blind_watermark import WaterMark
 from PIL import Image
 
 from app.watermark import Payload, WatermarkEngine, locate
-from app.watermark.engine import add_headroom, coarse_percents
+from app.watermark.engine import (
+    LOCATE_FINE_WINDOW_PCT,
+    add_headroom,
+    coarse_percents,
+    locate_coarse,
+)
 from app.watermark.payload import WM_BIT_LENGTH
 from tests.conftest import (
     PW_IMG,
     PW_WM,
+    chat_window,
     desktop_screenshot,
     flat_share,
     jpeg,
@@ -242,4 +248,87 @@ def test_locate_finds_forwarded_copy(engine: WatermarkEngine, tmp_path: Path) ->
     assert match is not None
     assert match.confidence > 0.9, f"совпадение всего {match.confidence:.0%}"
     assert match.box[2:] == result.size
+    assert engine.extract(match.crop, result.size) == PAYLOAD
+
+
+
+#: Окна мессенджера, снятые с реальных экранов. Размер тут не декорация:
+#: грубый проход ужимает скриншот под 900 px, и от размера окна зависит, в
+#: какую точку сетки перебора попадёт настоящий масштаб.
+WINDOWS = [(1053, 900), (1280, 800), (1440, 900), (1920, 1080)]
+
+
+@pytest.fixture(scope="session")
+def lesson_800(tmp_path_factory: pytest.TempPathFactory):
+    """Боевая геометрия урока: тёмный график, длинная сторона 800 (LESSON_MAX_SIDE).
+
+    Session-scope намеренно: встраивание метки — самая дорогая операция в этом
+    файле, а перебор окон и масштабов сам по себе дешёвый.
+    """
+    engine = WatermarkEngine(password_img=PW_IMG, password_wm=PW_WM)
+    folder = tmp_path_factory.mktemp("lesson800")
+    source = folder / "terminal.png"
+    make_terminal_chart(width=800, height=518, dark=True).save(source)
+    result = engine.embed(source, folder / "marked.png", PAYLOAD)
+    with Image.open(result.path) as image:
+        # Ученику картинка приходит фотографией, то есть уже пережатой Telegram.
+        received = jpeg(image, 87)
+    return source, result, received
+
+
+@pytest.mark.parametrize("canvas", WINDOWS)
+@pytest.mark.parametrize("scale", [0.45, 0.5, 0.55, 0.65, 0.7, 0.8, 0.9, 0.95])
+def test_coarse_pass_lands_in_fine_window(
+    lesson_800, canvas: tuple[int, int], scale: float
+) -> None:
+    """Договор между двумя проходами поиска, который раньше нарушался.
+
+    Точный проход просматривает только окно ±``LOCATE_FINE_WINDOW_PCT`` вокруг
+    оценки грубого. Значит промах грубого прохода дальше этого окна — не
+    неточность, а потеря: настоящий масштаб не будет просмотрен никогда, и
+    метку прочитать станет неоткуда.
+
+    Проверяется именно инвариант, а не итог целиком: он дешёвый, поэтому его
+    можно прогнать по сетке окон и масштабов, а не по трём удобным. Раньше на
+    этой сетке промахивалась примерно треть сочетаний.
+    """
+    source, _result, received = lesson_800
+    shot = to_bgr(jpeg(chat_window(received, scale, canvas=canvas), 90))
+
+    coarse = locate_coarse(shot, source)
+    assert coarse is not None, "урок не опознан вовсе"
+
+    shown = round(scale * 100)
+    assert abs(coarse.percent - shown) <= LOCATE_FINE_WINDOW_PCT, (
+        f"окно {canvas[0]}×{canvas[1]}: грубый проход сказал {coarse.percent}% "
+        f"вместо {shown}% — точный будет искать в "
+        f"{coarse.percent - LOCATE_FINE_WINDOW_PCT}.."
+        f"{coarse.percent + LOCATE_FINE_WINDOW_PCT}% и настоящий масштаб пропустит"
+    )
+
+
+@pytest.mark.parametrize("scale", [0.5, 0.65, 0.7, 0.9, 0.95])
+def test_locate_survives_any_display_scale(
+    engine: WatermarkEngine, lesson_800, scale: float
+) -> None:
+    """Тот же дефект, но целиком: от скриншота до прочитанной метки.
+
+    Пришло из жизни: трассировка отвечала «урок найден, но метка не читается»
+    практически на всё. Урок опознавался, а область на скриншоте выделялась
+    крошечная — 126×82 вместо 720×466, — и читать метку было уже неоткуда.
+
+    Старые тесты брали масштабы 0.6, 0.55 и 0.2 в окне 1600×1000 и случайно
+    попадали в удачные сочетания, поэтому дефект прожил до боевой эксплуатации.
+    """
+    source, result, received = lesson_800
+    shot = to_bgr(jpeg(chat_window(received, scale), 90))
+
+    match = locate(shot, source)
+    assert match is not None, "область урока не найдена вовсе"
+
+    expected = round(result.size[0] * scale)
+    assert abs(match.box[2] - expected) <= 3, (
+        f"выделена не та область: {match.box[2]}×{match.box[3]} вместо ~{expected} "
+        f"(похожесть {match.confidence:.2f})"
+    )
     assert engine.extract(match.crop, result.size) == PAYLOAD

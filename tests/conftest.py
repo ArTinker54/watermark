@@ -168,6 +168,30 @@ def screenshot(
     return shot
 
 
+def chat_window(
+    photo: Image.Image,
+    scale: float,
+    *,
+    canvas: tuple[int, int] = (1053, 900),
+    offset: tuple[int, int] = (95, 110),
+) -> Image.Image:
+    """Снимок окна мессенджера, где картинка лежит в пузыре сообщения.
+
+    Размер окна взят с реального скриншота клиента, и это не придирка к числу:
+    грубый проход поиска ужимает скриншот под 900 px, поэтому от размера окна
+    зависит, попадёт ли настоящий масштаб в сетку перебора. На «удобном» окне
+    промах не воспроизводится вовсе.
+    """
+    shown = rescale(photo, scale)
+    shot = Image.new("RGB", canvas, (23, 26, 31))
+    draw = ImageDraw.Draw(shot)
+    draw.rectangle([0, 0, 30, canvas[1]], fill=(31, 35, 42))
+    draw.rectangle([offset[0], 60, offset[0] + shown.width, 100], fill=(43, 82, 120))
+    draw.rectangle([0, canvas[1] - 70, canvas[0], canvas[1]], fill=(31, 35, 42))
+    shot.paste(shown, offset)
+    return shot
+
+
 def desktop_screenshot(
     chart: Image.Image,
     scale: float,

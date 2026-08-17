@@ -113,6 +113,17 @@ def _format_miss(miss: TraceMiss) -> str:
         lines += [f"Сырое чтение: <code>{quote(miss.payload_raw)}</code>", ""]
     if miss.best_lesson_id is not None:
         lines.append(f"Похоже на урок #{miss.best_lesson_id}")
+    # Геометрия показывается при любом отказе, а не только при мелком масштабе.
+    # Это не подробность для галочки: однажды поиск выделял 131×85 вместо
+    # 536×347 и отвечал «метка не читается» — по самому тексту отказа отличить
+    # это от честного «пережали» было нельзя, а по числам видно сразу.
+    if miss.found_size is not None and miss.original_size is not None:
+        found = f"{miss.found_size[0]}×{miss.found_size[1]}"
+        whole = f"{miss.original_size[0]}×{miss.original_size[1]}"
+        share = f" — {miss.scale:.0%} от оригинала {whole}" if miss.scale else ""
+        lines.append(f"Область урока: {found}{share}")
+    if miss.best_confidence is not None:
+        lines.append(f"Похожесть: {miss.best_confidence:.2f}")
     lines.append(f"Проверено оригиналов: {miss.checked}")
     return "\n".join(lines)
 
