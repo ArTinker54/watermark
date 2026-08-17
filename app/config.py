@@ -92,11 +92,20 @@ class Settings(BaseSettings):
             "Пусто — не проверять."
         ),
     )
+    selfcheck_uid: int | None = Field(
+        default=None,
+        description=(
+            "Номер участника для разбора при старте вместе с SELFCHECK_LESSON: "
+            "кто это, выдавалась ли ему копия и читается ли из неё метка. "
+            "Пусто — не разбирать."
+        ),
+    )
     log_level: str = Field(default="INFO")
 
     @field_validator(
         "vsa_group_id",
         "selfcheck_lesson",
+        "selfcheck_uid",
         "db_path",
         "storage_path",
         "offer_path",

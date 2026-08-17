@@ -21,7 +21,7 @@ def _settings(**overrides: object) -> Settings:
 
 
 @pytest.mark.parametrize("raw", ["", "   "])
-@pytest.mark.parametrize("field", ["vsa_group_id", "selfcheck_lesson"])
+@pytest.mark.parametrize("field", ["vsa_group_id", "selfcheck_lesson", "selfcheck_uid"])
 def test_blank_optional_means_disabled(field: str, raw: str) -> None:
     """``VSA_GROUP_ID=`` — это выключенная проверка, а не ошибка конфига.
 

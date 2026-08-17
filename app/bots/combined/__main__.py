@@ -43,7 +43,13 @@ async def selfcheck(settings: Settings, database: Database) -> None:
     storage = Storage(root=settings.storage_path)
     async with database.session_factory() as session:
         try:
-            lines = await check(session, storage, engine, settings.selfcheck_lesson)
+            lines = await check(
+                session,
+                storage,
+                engine,
+                settings.selfcheck_lesson,
+                settings.selfcheck_uid,
+            )
         except Exception:
             logger.exception("самопроверка метки сорвалась")
             return

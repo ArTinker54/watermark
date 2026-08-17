@@ -16,7 +16,14 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.repo import get_lesson, list_issued_payloads, list_lessons
+from app.db import Lesson
+from app.db.repo import (
+    get_delivery,
+    get_lesson,
+    get_student_by_uid,
+    list_issued_payloads,
+    list_lessons,
+)
 from app.services.storage import Storage
 from app.watermark import Payload, WatermarkEngine, load_bgr, locate
 from app.watermark.engine import EMBED_VERSION
@@ -39,6 +46,7 @@ async def check(
     storage: Storage,
     engine: WatermarkEngine,
     lesson_id: int | None = None,
+    uid: int | None = None,
 ) -> list[str]:
     """Отчёт строками. Формат общий и для сообщения в чат, и для логов."""
     if lesson_id is not None:
@@ -95,9 +103,11 @@ async def check(
         return lines
 
     for copy in copies[:SAMPLE]:
-        uid = uid_from_name(copy)
+        # Имя переменной не ``uid``: тем же именем зовётся разбираемый участник,
+        # и затирание превратило бы разбор в отчёт по последней вскрытой копии.
+        owner = uid_from_name(copy)
         read = await asyncio.to_thread(engine.extract, copy, (width, height))
-        expected = Payload(uid=uid, lesson_id=lesson.id).encode() if uid else None
+        expected = Payload(uid=owner, lesson_id=lesson.id).encode() if owner else None
         ok = read is not None and read.encode() == expected
         got = read.encode() if read else "не читается"
         lines.append(f"{'ОК ' if ok else 'СБОЙ'} {copy.name} -> {got}")
@@ -108,4 +118,53 @@ async def check(
     found = await asyncio.to_thread(locate, sample, original)
     if found is not None:
         lines.append(f"похожесть выданной копии с оригиналом: {found.confidence:.4f}")
+
+    if uid is not None:
+        lines += await _about(session, lesson, uid, (width, height), storage, engine)
+    return lines
+
+
+async def _about(
+    session: AsyncSession,
+    lesson: Lesson,
+    uid: int,
+    size: tuple[int, int],
+    storage: Storage,
+    engine: WatermarkEngine,
+) -> list[str]:
+    """Разбор одного участника: кто это и что ему выдавали.
+
+    Нужен, когда трассировка назвала номер и его надо сверить с журналом
+    руками: совпадает ли метка в лежащей на диске копии с тем, что записано
+    в выдаче, и кто вообще этот номер.
+    """
+    payload = Payload(uid=uid, lesson_id=lesson.id)
+    lines = [f"--- разбор участника {uid:04d} по уроку #{lesson.id} ---"]
+
+    student = await get_student_by_uid(session, uid)
+    if student is None:
+        return [*lines, f"участника с номером {uid:04d} в базе нет"]
+    lines.append(
+        f"это {student.display_name}, tg_id={student.tg_user_id}, "
+        f"статус {student.status.value}"
+    )
+
+    delivery = await get_delivery(session, lesson_id=lesson.id, student_id=student.id)
+    if delivery is None:
+        lines.append("записи о выдаче нет: этот урок ему не отправляли")
+    else:
+        same = "совпадает" if delivery.wm_payload == payload.encode() else "НЕ СОВПАДАЕТ"
+        lines.append(
+            f"выдача: {delivery.status.value} от {delivery.delivered_at}, "
+            f"метка в журнале {delivery.wm_payload} — {same} с ожидаемой"
+        )
+
+    copy = storage.marked(lesson.id, uid, 0)
+    if not await asyncio.to_thread(copy.exists):
+        return [*lines, f"персональной копии на диске нет: {copy.name}"]
+
+    read = await asyncio.to_thread(engine.extract, copy, size)
+    got = read.encode() if read else "не читается"
+    verdict = "СХОДИТСЯ" if read is not None and read.encode() == payload.encode() else "РАСХОДИТСЯ"
+    lines.append(f"метка из копии {copy.name}: {got} — {verdict}")
     return lines

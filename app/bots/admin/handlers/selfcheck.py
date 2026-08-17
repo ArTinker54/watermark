@@ -28,10 +28,13 @@ async def selftest(
     engine: WatermarkEngine,
 ) -> None:
     """Проверить, что метка вшивается и читается — на боевом материале."""
-    raw = (command.args or "").strip().lstrip("#")
-    lesson_id = int(raw) if raw.isdigit() else None
+    # «/selftest 143 195» — урок и, если нужно, конкретный участник.
+    parts = (command.args or "").replace("#", " ").split()
+    numbers = [int(item) for item in parts if item.isdigit()]
+    lesson_id = numbers[0] if numbers else None
+    uid = numbers[1] if len(numbers) > 1 else None
 
     status = await message.answer("Проверяю метку на выданных копиях…")
-    lines = await check(session, storage, engine, lesson_id)
+    lines = await check(session, storage, engine, lesson_id, uid)
     body = "\n".join(f"• {quote(line)}" for line in lines)
     await status.edit_text(f"<b>Самопроверка метки</b>\n\n{body}")
