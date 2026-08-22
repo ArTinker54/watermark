@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     # --- Telegram ---
     admin_bot_token: str = Field(description="Токен закрытого бота автора")
     student_bot_token: str = Field(description="Токен публичного бота учеников")
+    dm_bot_token: str = Field(
+        default="",
+        description=(
+            "Токен бота личных сообщений (Telegram Business). Пусто — бот не "
+            "поднимается, остальные два работают как обычно"
+        ),
+    )
     admin_ids: str = Field(
         default="",
         description="Telegram user_id администраторов через запятую",

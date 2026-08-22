@@ -316,3 +316,37 @@ class TraceAttempt(Base):
     )
     note: Mapped[str | None] = mapped_column(String(512), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DmDialog(Base):
+    """Разговор бота в личке автора: с кем, докуда дошли и когда молчать.
+
+    Нужна ради одного: бот обязан замолчать, как только в переписку вступила
+    сама Алёна. Держать это в памяти процесса нельзя — перезапуск (а он бывает
+    на каждом выпуске) стёр бы отметку, и бот влез бы репликой в живой
+    разговор. Поэтому состояние переживает рестарт.
+    """
+
+    __tablename__ = "dm_dialogs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    connection_id: Mapped[str] = mapped_column(String(64))
+    """Куда отвечать: без business_connection_id сообщение уйдёт от бота, а не от автора."""
+
+    greeted_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    """Когда показали меню. Второй раз здороваться не надо."""
+
+    nudged_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    """Когда последний раз отвечали на вопрос не из списка — защита от частокола меню."""
+
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    """До этого момента бот в этом чате молчит: разговор ведёт живой человек."""
+
+    called_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    """Когда человек позвал автора — чтобы не звать её десять раз подряд."""
+
+    viewed: Mapped[str] = mapped_column(String(512), default="")
+    """Ключи открытых ответов через запятую — попадают в карточку для автора."""
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

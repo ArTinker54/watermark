@@ -15,6 +15,7 @@ import asyncio
 import logging
 
 from app.bots.admin.setup import build_admin
+from app.bots.dm.setup import build_dm
 from app.bots.runtime import make_bot, migrate_group_to_course, run_bots
 from app.bots.student.setup import build_student
 from app.config import Settings, get_settings
@@ -79,6 +80,13 @@ async def main() -> None:
         build_student(settings, database, bot=student_bot, admin_notifier=admin_bot),
         build_admin(settings, database, student_bot=student_bot, bot=admin_bot),
     ]
+    # Бот личных сообщений добавляется, только если задан его токен: без него
+    # ничего не ломается, а рассылка материалов от него не зависит.
+    dm = build_dm(settings, database)
+    if dm is not None:
+        runtimes.append(dm)
+    else:
+        logger.info("DM_BOT_TOKEN не задан — бот личных сообщений не запускается")
     try:
         await run_bots(runtimes, database)
     finally:
