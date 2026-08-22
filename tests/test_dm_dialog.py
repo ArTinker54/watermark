@@ -20,7 +20,7 @@ from app.bots.dm.dialog import (
     may_call,
     viewed_keys,
 )
-from app.bots.dm.handlers import card, from_owner_side, menu
+from app.bots.dm.handlers import after_answer, card, from_owner_side, menu
 from app.db import DmDialog, utcnow
 
 
@@ -212,3 +212,42 @@ def test_otvety_vlezayut_v_odno_soobschenie() -> None:
     """Ответ длиннее лимита Telegram просто не уйдёт."""
     for answer in faq.FAQ:
         assert len(answer.body()) < 4096, answer.key
+
+
+def keys_of(keyboard) -> list[str]:
+    return [
+        button.callback_data.split(":", 1)[1]
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+
+def test_pod_otvetom_ne_ves_spisok_a_dve_knopki() -> None:
+    """Пришло от автора после первого дня работы.
+
+    Под готовым ответом снова разворачивалось полное меню: сам ответ уезжал
+    вверх, а человек видел те же десять кнопок, будто ничего не выбирал.
+    Нужны ровно две — вернуться к вопросам и позвать человека.
+    """
+    keys = keys_of(after_answer())
+
+    assert keys == [faq.BACK, faq.CALL_HUMAN]
+
+
+def test_knopka_nazad_ne_putaetsya_s_otvetom() -> None:
+    """У «Других вопросов» не должно быть ответа в списке.
+
+    Иначе обработчик показал бы её как обычный пункт, и возврат к меню
+    молча превратился бы в ещё один ответ.
+    """
+    assert faq.BACK not in faq.BY_KEY
+    assert faq.CALL_HUMAN not in faq.BY_KEY
+
+
+def test_polnoe_menyu_ostalos_polnym() -> None:
+    """Само меню не должно было пострадать: там по-прежнему все вопросы."""
+    keys = keys_of(menu())
+
+    assert keys[:-1] == [answer.key for answer in faq.FAQ]
+    assert keys[-1] == faq.CALL_HUMAN
+    assert faq.BACK not in keys, "в полном меню возвращаться некуда"

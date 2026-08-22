@@ -72,6 +72,26 @@ def menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def after_answer() -> InlineKeyboardMarkup:
+    """Клавиатура под готовым ответом: назад к списку и вызов человека.
+
+    Полное меню тут не годится. Оно длиннее любого ответа, и человек, открывший
+    один вопрос, получал экран, где сам ответ уехал вверх, а под ним снова
+    десять кнопок — будто ничего и не выбирал.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=faq.BACK_BUTTON, callback_data=f"{_PREFIX}:{faq.BACK}")],
+            [
+                InlineKeyboardButton(
+                    text=faq.CALL_HUMAN_BUTTON,
+                    callback_data=f"{_PREFIX}:{faq.CALL_HUMAN}",
+                )
+            ],
+        ]
+    )
+
+
 def card(user: User | None, viewed: list[str]) -> str:
     """Карточка для автора: кто спрашивает и что уже успел прочитать.
 
@@ -205,13 +225,22 @@ async def show_answer(
         await _call_human(callback, session, bot, chat_id, connection_id)
         return
 
+    if key == faq.BACK:
+        await callback.answer()
+        await _say(
+            bot, chat_id, faq.MENU_AGAIN, connection_id=connection_id, keyboard=menu()
+        )
+        return
+
     answer = faq.BY_KEY.get(key)
     if answer is None:
         await callback.answer("Этого ответа больше нет в списке", show_alert=True)
         return
 
     await callback.answer()
-    await _say(bot, chat_id, answer.body(), connection_id=connection_id, keyboard=menu())
+    await _say(
+        bot, chat_id, answer.body(), connection_id=connection_id, keyboard=after_answer()
+    )
     record = await dialog.touch(session, chat_id, connection_id or "")
     await dialog.mark_viewed(session, record, key)
 
