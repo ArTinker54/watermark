@@ -13,6 +13,7 @@ from html.parser import HTMLParser
 from app.bots.dm import faq
 from app.bots.dm.dialog import (
     CALL_COOLDOWN,
+    HANDOVER,
     MUTE,
     NUDGE_COOLDOWN,
     Reply,
@@ -86,7 +87,7 @@ def test_molchanie_ne_vechnoe_i_razgovor_nachinaetsya_zanovo() -> None:
 
 
 def test_avtora_ne_dergaem_dvazhdy_ot_odnogo_nazhatiya() -> None:
-    """Двойное нажатие «Позвать Елену» не должно давать две карточки."""
+    """Двойное нажатие «Позвать Алёну» не должно давать две карточки."""
     now = utcnow()
 
     assert may_call(None, now)
@@ -251,3 +252,56 @@ def test_polnoe_menyu_ostalos_polnym() -> None:
     assert keys[:-1] == [answer.key for answer in faq.FAQ]
     assert keys[-1] == faq.CALL_HUMAN
     assert faq.BACK not in keys, "в полном меню возвращаться некуда"
+
+
+def test_posle_vyzova_avtora_bot_zamolkaet() -> None:
+    """Кнопка «Позвать Алёну» приглашает задать вопрос — значит бот умолкает.
+
+    Иначе на прямую просьбу к человеку он ответил бы «такого нет в списке»
+    ровно там, где человека уже ждут.
+    """
+    now = utcnow()
+    dialog = talk(greeted_at=now - timedelta(minutes=5), called_at=now,
+                  muted_until=now + HANDOVER)
+
+    assert decide(dialog, now) is Reply.SILENT
+
+
+def test_molchanie_posle_vyzova_ne_navsegda() -> None:
+    """Если автор так и не ответила, разговор не должен остаться запертым."""
+    now = utcnow()
+    dialog = talk(
+        greeted_at=now - HANDOVER - timedelta(days=1),
+        called_at=now - HANDOVER - timedelta(minutes=1),
+        muted_until=now - timedelta(minutes=1),
+    )
+
+    assert decide(dialog, now) is Reply.GREET
+
+
+def test_privetstvie_neset_usloviya_avtora() -> None:
+    """Условия про автоследование автор просила показывать всем и жирным.
+
+    Место выбрано так, чтобы их увидел каждый: приветствие приходит до любого
+    вопроса. Тест держит их на месте, если приветствие будут править.
+    """
+    assert faq.TERMS in faq.GREETING
+    assert "<b>" in faq.TERMS
+    assert "не автоследование" in faq.TERMS
+
+
+def test_vopros_ne_teryaet_ssylku() -> None:
+    """У ответов, которые ведут на оплату или пост, ссылка обязана быть.
+
+    Ответ без неё бесполезен: человек спросил именно «где», а получил бы «да,
+    такое есть».
+    """
+    must_link = {
+        "club": "yookassa.ru",
+        "reviews": "metodtradingVSAotziv",
+        "individual": "MethodTrading1/30",
+        "one_idea": "MethodTrading1/35",
+        "copy_trades": "myTradingMethod",
+    }
+    for key, needle in must_link.items():
+        assert needle in faq.BY_KEY[key].text, key

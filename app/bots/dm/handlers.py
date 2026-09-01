@@ -47,7 +47,7 @@ _PREFIX = "faq"
 #: за край, поэтому превью гасим.
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-#: Кого уведомлять о нажатии «Позвать Елену». Узнаём из подключения — оно
+#: Кого уведомлять о нажатии «Позвать Алёну». Узнаём из подключения — оно
 #: приходит и при старте бота, если бот уже подключён к аккаунту.
 _owner: dict[str, int] = {}
 
@@ -252,10 +252,10 @@ async def _call_human(
     chat_id: int,
     connection_id: str | None,
 ) -> None:
-    """«Позвать Елену»: подтвердить человеку и дёрнуть автора карточкой."""
+    """«Позвать Алёну»: подтвердить человеку и дёрнуть автора карточкой."""
     record = await dialog.touch(session, chat_id, connection_id or "")
     if not dialog.may_call(record):
-        await callback.answer("Уже передала — Елена ответит здесь же.", show_alert=True)
+        await callback.answer("Уже передала — Алёна ответит здесь же.", show_alert=True)
         return
 
     await callback.answer()
