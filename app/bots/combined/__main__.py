@@ -22,10 +22,29 @@ from app.config import Settings, get_settings
 from app.db import Database, create_database
 from app.logging_setup import setup_logging
 from app.services import Storage
+from app.services.cleanup import report, usage
 from app.services.selfcheck import check
 from app.watermark import WM_BIT_LENGTH, WatermarkEngine
 
 logger = logging.getLogger(__name__)
+
+
+async def show_disk(settings: Settings) -> None:
+    """Написать в логи, сколько места на томе и куда оно ушло.
+
+    Не роскошь: когда том кончился, бот перестал принимать картинки и говорил
+    людям «не удалось прочитать картинку», то есть винил их файл. Настоящая
+    причина видна была только в тексте ошибки, и то не сразу. Теперь она
+    видна на каждом старте, а при нехватке места — с предупреждением.
+    """
+    try:
+        current = await asyncio.to_thread(usage, Storage(root=settings.storage_path))
+    except OSError:
+        logger.exception("не удалось измерить место на томе")
+        return
+    speak = logger.warning if current.tight else logger.info
+    for line in report(current):
+        speak("ДИСК: %s", line)
 
 
 async def selfcheck(settings: Settings, database: Database) -> None:
@@ -69,6 +88,7 @@ async def main() -> None:
     database = create_database(settings)
     await database.create_all()
     await migrate_group_to_course(database, settings)
+    await show_disk(settings)
     await selfcheck(settings, database)
 
     # По одному объекту Bot на токен: student-бот и принимает /start, и

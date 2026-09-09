@@ -1846,3 +1846,41 @@ async def test_trace_obrezannogo_uvelichennogo_skrinshota(
     assert isinstance(result, TraceHit), getattr(result, "reason", result)
     assert result.payload == Payload(uid=borya.uid, lesson_id=lesson.id)
     assert result.student is not None and result.student.tg_user_id == borya.tg_user_id
+
+
+async def test_kopii_ne_ostayutsya_na_tome_posle_rassylki(
+    database, storage: Storage, engine: WatermarkEngine, settings: Settings, lesson_source: Path
+) -> None:
+    """Персональные копии не должны копиться на диске.
+
+    Пришло из жизни, и дорого. На каждый урок раздача делает по копии на
+    ученика: сто учеников — сто файлов. Никто их не убирал, том кончился, и
+    бот перестал принимать картинки — с сообщением «не удалось прочитать
+    картинку», то есть виня файл человека вместо диска.
+
+    Копию можно удалять смело: она собирается детерминированно из оригинала и
+    метки, и при повторной рассылке появится заново. Оригинал — нельзя, и это
+    проверяется здесь же.
+    """
+    await _register(database, 7001, "Анна")
+    await _register(database, 7002, "Борис")
+
+    async with database.session_factory() as session:
+        lesson = await save_lesson(
+            session,
+            storage,
+            admin_tg_id=1,
+            caption="Урок про объёмы",
+            staged=[lesson_source],
+            max_side=settings.lesson_max_side,
+        )
+        students = list(await list_active_students(session))
+
+    bot = FakeBot(outbox=settings.storage_path / "outbox")
+    report = await _broadcaster(bot, engine, storage, database, settings).run(
+        LessonSpec.of(lesson), students
+    )
+
+    assert report.sent == 2
+    assert not list(storage.marked_root.rglob("*.png")), "копии остались на диске"
+    assert list(storage.lessons_root.rglob("*.png")), "оригинал урока пропал"

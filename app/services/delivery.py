@@ -141,6 +141,22 @@ def _batched(images: Sequence[Path], size: int = MEDIA_GROUP_LIMIT) -> list[Sequ
     return [images[start : start + size] for start in range(0, len(images), size)]
 
 
+def drop_copies(paths: Sequence[Path]) -> None:
+    """Убрать персональные копии после отправки.
+
+    Копия детерминирована: тот же оригинал плюс та же метка дают тот же файл,
+    поэтому при повторной рассылке она соберётся заново. А вот накапливаться
+    ей нельзя — на каждый урок это по файлу на ученика, и однажды том просто
+    кончился: бот перестал принимать картинки и жаловался на них же, хотя
+    настоящей причиной было «No space left on device».
+    """
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:  # noqa: PERF203 - одна осечка не должна рвать рассылку
+            logger.warning("не удалось убрать копию %s: %s", path, exc)
+
+
 class LessonBroadcaster:
     """Готовит меченые копии и раздаёт их через токен student-bot."""
 
@@ -390,6 +406,7 @@ class LessonBroadcaster:
                 status=DeliveryStatus.SENT,
                 tg_message_id=message_id,
             )
+        await asyncio.to_thread(drop_copies, marked)
         logger.info(
             "урок %d выдан uid=%s payload=%s",
             lesson.lesson_id,
