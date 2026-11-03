@@ -142,12 +142,14 @@ def _format_hit(hit: TraceHit) -> str:
     lines = [
         "<b>Метка найдена</b>",
         "",
-        f"Материал: <b>{hit.lesson.title}</b> от {format_dt(hit.lesson.created_at)}",
+        f"Материал: <b>{quote(hit.lesson.title)}</b> от {format_dt(hit.lesson.created_at)}",
     ]
 
     if hit.student is not None:
+        # Имя — из Telegram. Один «<» в нём, и Telegram отвергнет ответ целиком:
+        # автор не увидит ровно то, ради чего присылал картинку.
         lines += [
-            f"Участник: <b>{hit.payload.uid:04d}</b> — {hit.student.display_name}",
+            f"Участник: <b>{hit.payload.uid:04d}</b> — {quote(hit.student.display_name)}",
             f"Telegram ID: <code>{hit.student.tg_user_id}</code>",
         ]
     else:

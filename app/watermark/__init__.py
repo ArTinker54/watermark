@@ -35,6 +35,7 @@ from app.watermark.payload import (
 from app.watermark.verify import (
     MAX_DAMAGED_BITS,
     MIN_MARGIN,
+    Circle,
     NearMiss,
     SoftRead,
     Verdict,
@@ -55,6 +56,7 @@ __all__ = [
     "PAYLOAD_VERSION",
     "READABLE_SCALE",
     "WM_BIT_LENGTH",
+    "Circle",
     "CoarseMatch",
     "EmbedResult",
     "LocateMatch",

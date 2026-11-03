@@ -280,50 +280,70 @@ class NearMiss:
     """Выданная копия, которая могла быть источником повреждённой метки."""
 
     payload: str
-    mismatched_key: int
-    """Сколько опознающих бит пришлось бы списать на сбой, будь это она."""
+    gap: float
+    """Насколько эта копия объясняет прочитанное хуже первой в круге.
+
+    В тех же единицах, что и ``Verdict.margin``: доли уверенности одного бита.
+    Ниже ``MIN_MARGIN`` копия от первой не отличается — между ними выбирает
+    один едва прочитанный бит.
+    """
+
+    @property
+    def level_with_first(self) -> bool:
+        return self.gap < MIN_MARGIN
 
 
-def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 5) -> list[NearMiss]:
-    """Круг копий, из которых могла получиться прочитанная метка.
+@dataclass(frozen=True, slots=True)
+class Circle:
+    """Круг копий, из которых могла получиться повреждённая метка."""
+
+    members: tuple[NearMiss, ...]
+    level_total: int
+    """Сколько выданных копий вровень с первой, считая её саму.
+
+    Может быть больше, чем показано: круг ограничен, а молча обрезанный
+    список выглядит полным.
+    """
+
+
+def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 5) -> Circle:
+    """Копии, которые лучше всех объясняют прочитанное, — по порядку.
 
     Показывается автору вместо имени, когда назвать человека нельзя: это
     честная формулировка «вот кто мог быть, но метка повреждена».
 
-    Отбор идёт по опознающим битам, а не по общему числу расхождений. Помехи в
-    остальных битах одинаковы для всех выданных копий — там у всех записано
-    одно и то же, — поэтому никого друг от друга не отличают. Раньше отбор
-    шёл по общему числу и обрывался на двух: на боевой метке с шестью такими
-    помехами список выходил пустым у всех ста семидесяти копий, и автор
-    получал «сузить не удалось», хотя ближайшая копия разошлась с прочитанным
-    всего в одном опознающем бите.
+    Порядок — только по мягкому совпадению, без отбора по числу разошедшихся
+    бит. Оба прежних способа выбрасывали настоящего владельца:
+
+    * отбор по общему числу расхождений не больше двух давал пустой круг, едва
+      помехи ложились в биты, одинаковые у всех копий (боевой урок #322: шесть
+      таких помех, и «сузить не удалось» у всех 177 копий);
+    * отбор окном по опознающим битам терял владельца, когда два слабых сбоя
+      превращали метку в чужую выданную копию: у владельца два «мимо», и в
+      окно он не проходил, хотя по совпадению стоял вторым, почти вровень.
+
+    Число разошедшихся бит считает слабый и уверенный сбой одинаково, а
+    совпадение — нет. Поэтому решает оно.
     """
     centred = [value - read.threshold for value in read.values]
-    candidates = [(payload, bits_of(payload)) for payload in dict.fromkeys(issued)]
-    candidates = [item for item in candidates if len(item[1]) == len(centred)]
-    key_positions = set(varying_positions([bits for _, bits in candidates]))
-
-    scored: list[tuple[float, int, str]] = []
-    for payload, bits in candidates:
-        wrong_key = sum(
-            1
-            for index, (bit, offset) in enumerate(zip(bits, centred, strict=True))
-            if index in key_positions and (offset > 0) != bit
-        )
+    scored: list[tuple[float, str]] = []
+    for payload in dict.fromkeys(issued):
+        bits = bits_of(payload)
+        if len(bits) != len(centred):
+            continue
         score = sum(
             offset if bit else -offset for bit, offset in zip(bits, centred, strict=True)
         )
-        scored.append((score, wrong_key, payload))
+        scored.append((score, payload))
     if not scored:
-        return []
+        return Circle(members=(), level_total=0)
 
-    # Круг — ближайшие по опознающим битам и те, кому нужен ещё один сбой.
-    # Дальше уже не «могла быть», а «могла быть любая»: два сбоя в девяти
-    # битах делают похожими десятки копий.
-    nearest = min(wrong_key for _, wrong_key, _ in scored)
-    close = [item for item in scored if item[1] <= nearest + 1]
-    # Порядок — по тому, насколько метка объясняет прочитанное, а не по номеру:
-    # спорный бит, прочитанный едва-едва, весит меньше уверенно прочитанного.
-    close.sort(key=lambda item: (-item[0], item[2]))
-    return [NearMiss(payload=payload, mismatched_key=key) for _, key, payload in close[:limit]]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    best = scored[0][0]
+    unit = 2 * read.spread
+    gaps = [((best - score) / unit, payload) for score, payload in scored]
+    return Circle(
+        members=tuple(NearMiss(payload=payload, gap=gap) for gap, payload in gaps[:limit]),
+        level_total=sum(1 for gap, _ in gaps if gap < MIN_MARGIN),
+    )
 

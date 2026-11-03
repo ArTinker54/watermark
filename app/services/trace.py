@@ -41,6 +41,7 @@ from app.db.repo import (
 from app.watermark import (
     MIN_MARGIN,
     READABLE_SCALE,
+    Circle,
     CoarseMatch,
     NearMiss,
     Payload,
@@ -153,7 +154,9 @@ class _Candidate:
     coarse: CoarseMatch
 
 
-def _suspect_line(miss: NearMiss, students: Mapping[int, Student]) -> str | None:
+def _suspect_line(
+    miss: NearMiss, students: Mapping[int, Student], *, first: bool
+) -> str | None:
     parsed = Payload.parse(miss.payload)
     if parsed is None:
         return None
@@ -167,33 +170,49 @@ def _suspect_line(miss: NearMiss, students: Mapping[int, Student]) -> str | None
         who = escape(student.full_name or "без имени")
         if student.username:
             who += f" @{escape(student.username)}"
-    return f"• {parsed.uid:04d} — {who} (опознающих бит мимо: {miss.mismatched_key})"
+    # Число разошедшихся бит тут намеренно не печатается. «Мимо: 0» у первой
+    # строки читается как «опознающие биты сошлись именно с ним», а при слабо
+    # прочитанном бите первым как раз и встаёт чужая копия.
+    level = " — вровень с первым" if not first and miss.level_with_first else ""
+    return f"• {parsed.uid:04d} — {who}{level}"
 
 
 def _damaged_note(
     read: SoftRead,
     issued: Sequence[str],
     verdict: Verdict,
-    suspects: Sequence[NearMiss] = (),
+    circle: Circle | None = None,
     students: Mapping[int, Student] | None = None,
 ) -> str:
     """Объяснение, почему метка есть, а имени не будет.
 
     Кандидаты показываются намеренно: автору полезно знать круг, но между
     «вот эти шестеро» и «это он» — принципиальная разница, и стирать её нельзя.
-    Поэтому список подан как круг по убыванию вероятности, а не как ответ.
+    Поэтому список подан как круг, а не как ответ, и прямо сказано, что первый
+    в нём не обязательно источник.
     """
+    members = circle.members if circle is not None else ()
     lines = [
         line
-        for line in (_suspect_line(item, students or {}) for item in suspects)
+        for line in (
+            _suspect_line(item, students or {}, first=index == 0)
+            for index, item in enumerate(members)
+        )
         if line is not None
     ]
-    who = (
-        "\n\nКруг, по убыванию вероятности — это не доказательство, метка "
-        "повреждена:\n" + "\n".join(lines)
-        if lines
-        else " Кандидаты: сузить не удалось"
-    )
+    if lines:
+        who = (
+            "\n\nКруг — копии, которые лучше всех объясняют прочитанное, по "
+            "порядку. Это не доказательство: метка повреждена, и первый в списке "
+            "не обязательно источник. Кто «вровень с первым», от него по этой "
+            "картинке не отличается — между ними выбирает один едва прочитанный "
+            "бит.\n" + "\n".join(lines)
+        )
+        hidden = (circle.level_total if circle is not None else 0) - len(members)
+        if hidden > 0:
+            who += f"\n…и ещё {hidden} вровень с первым — по этой картинке круг шире"
+    else:
+        who = " Кандидаты: сузить не удалось"
 
     if verdict.mismatched_key:
         # Разошлись именно опознающие биты — те, которыми копии и отличаются
@@ -509,10 +528,10 @@ class TraceService:
             # нечестно. Пусть отказ объяснят по размеру и пережатию.
             return _Reading(raw=raw)
 
-        suspects = near_misses(read, issued)
+        circle = near_misses(read, issued)
         students: dict[int, Student] = {}
         async with self._session_factory() as session:
-            for item in suspects:
+            for item in circle.members:
                 parsed = Payload.parse(item.payload)
                 if parsed is None:
                     continue
@@ -522,16 +541,17 @@ class TraceService:
 
         logger.info(
             "метка урока %d прочиталась ненадёжно: расхождений %d (опознающих %d), "
-            "отрыв %.2f, шаткий бит %.2f, круг %s",
+            "отрыв %.2f, шаткий бит %.2f, круг %s, вровень с первым %d",
             lesson.id,
             verdict.mismatched,
             verdict.mismatched_key,
             verdict.margin,
             verdict.weakest_bit,
-            [item.payload for item in suspects],
+            [f"{item.payload} +{item.gap:.2f}" for item in circle.members],
+            circle.level_total,
         )
         return _Reading(
-            raw=raw, damaged=_damaged_note(read, issued, verdict, suspects, students)
+            raw=raw, damaged=_damaged_note(read, issued, verdict, circle, students)
         )
 
     async def _try_fragment(
