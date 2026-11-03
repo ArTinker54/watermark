@@ -35,6 +35,7 @@ from app.watermark.payload import (
 from app.watermark.verify import (
     MAX_DAMAGED_BITS,
     MIN_MARGIN,
+    NearMiss,
     SoftRead,
     Verdict,
     bits_of,
@@ -57,6 +58,7 @@ __all__ = [
     "CoarseMatch",
     "EmbedResult",
     "LocateMatch",
+    "NearMiss",
     "Payload",
     "Rebuilt",
     "SoftRead",

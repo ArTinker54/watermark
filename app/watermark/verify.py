@@ -275,27 +275,55 @@ def match(read: SoftRead, issued: Iterable[str]) -> Verdict | None:
     )
 
 
-def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 3) -> list[str]:
-    """Метки, до которых прочитанному не хватило одного-двух бит.
+@dataclass(frozen=True, slots=True)
+class NearMiss:
+    """Выданная копия, которая могла быть источником повреждённой метки."""
 
-    Показываются автору вместо имени, когда назвать человека нельзя: это
+    payload: str
+    mismatched_key: int
+    """Сколько опознающих бит пришлось бы списать на сбой, будь это она."""
+
+
+def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 5) -> list[NearMiss]:
+    """Круг копий, из которых могла получиться прочитанная метка.
+
+    Показывается автору вместо имени, когда назвать человека нельзя: это
     честная формулировка «вот кто мог быть, но метка повреждена».
+
+    Отбор идёт по опознающим битам, а не по общему числу расхождений. Помехи в
+    остальных битах одинаковы для всех выданных копий — там у всех записано
+    одно и то же, — поэтому никого друг от друга не отличают. Раньше отбор
+    шёл по общему числу и обрывался на двух: на боевой метке с шестью такими
+    помехами список выходил пустым у всех ста семидесяти копий, и автор
+    получал «сузить не удалось», хотя ближайшая копия разошлась с прочитанным
+    всего в одном опознающем бите.
     """
     centred = [value - read.threshold for value in read.values]
-    close: list[tuple[int, float, str]] = []
-    for payload in dict.fromkeys(issued):
-        bits = bits_of(payload)
-        if len(bits) != len(centred):
-            continue
-        mismatched = sum((offset > 0) != bit for bit, offset in zip(bits, centred, strict=True))
-        if mismatched > 2:
-            continue
+    candidates = [(payload, bits_of(payload)) for payload in dict.fromkeys(issued)]
+    candidates = [item for item in candidates if len(item[1]) == len(centred)]
+    key_positions = set(varying_positions([bits for _, bits in candidates]))
+
+    scored: list[tuple[float, int, str]] = []
+    for payload, bits in candidates:
+        wrong_key = sum(
+            1
+            for index, (bit, offset) in enumerate(zip(bits, centred, strict=True))
+            if index in key_positions and (offset > 0) != bit
+        )
         score = sum(
             offset if bit else -offset for bit, offset in zip(bits, centred, strict=True)
         )
-        close.append((mismatched, -score, payload))
-    # Порядок — по тому, насколько метка объясняет прочитанное, а не по алфавиту:
-    # иначе настоящий владелец вылетает из короткого списка из-за своего номера.
-    close.sort()
-    return [payload for _, _, payload in close[:limit]]
+        scored.append((score, wrong_key, payload))
+    if not scored:
+        return []
+
+    # Круг — ближайшие по опознающим битам и те, кому нужен ещё один сбой.
+    # Дальше уже не «могла быть», а «могла быть любая»: два сбоя в девяти
+    # битах делают похожими десятки копий.
+    nearest = min(wrong_key for _, wrong_key, _ in scored)
+    close = [item for item in scored if item[1] <= nearest + 1]
+    # Порядок — по тому, насколько метка объясняет прочитанное, а не по номеру:
+    # спорный бит, прочитанный едва-едва, весит меньше уверенно прочитанного.
+    close.sort(key=lambda item: (-item[0], item[2]))
+    return [NearMiss(payload=payload, mismatched_key=key) for _, key, payload in close[:limit]]
 

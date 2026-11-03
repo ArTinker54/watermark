@@ -116,7 +116,9 @@ def test_near_misses_lists_the_plausible_candidates() -> None:
         for index, (a, b) in enumerate(zip(bits_of(TRUTH), bits_of(neighbour), strict=True))
         if a != b
     )
-    candidates = near_misses(with_bit_at(TRUTH, differing, offset=0.02), ISSUED)
+    candidates = [
+        item.payload for item in near_misses(with_bit_at(TRUTH, differing, offset=0.02), ISSUED)
+    ]
     assert neighbour in candidates
     assert TRUTH in candidates, "настоящий владелец обязан остаться в списке"
 
@@ -232,6 +234,64 @@ def test_shumnoe_chtenie_ne_daet_imeni_dazhe_pri_vernyh_opoznayuschih() -> None:
     assert verdict.mismatched_key == 0
     assert verdict.mismatched > MAX_NOISE_BITS
     assert not verdict.trustworthy
+
+
+def test_krug_ne_pustoy_pri_pomehah_v_obschih_bitah() -> None:
+    """Боевой случай урока #322: «ближайшая разошлась на 1 опознающий бит,
+    а всего мимо 7» — и при этом «кандидаты: сузить не удалось».
+
+    Шесть помех легли в биты, одинаковые у всех копий, ещё одна — в опознающий,
+    причём слабо, как это и бывает при пережатии. Круг обязан быть, и настоящий
+    владелец в нём — среди первых: помехи в общих битах никого не отличают.
+    """
+    noise = [index for index in range(95) if index not in key_bits()][:6]
+    bits = list(bits_of(WIDE_TRUTH))
+    for index in noise:
+        bits[index] = not bits[index]
+    values = [0.5 + (0.4 if bit else -0.4) for bit in bits]
+    shaky = key_bits()[3]
+    values[shaky] = 0.5 + (-0.03 if bits[shaky] else 0.03)
+    read = SoftRead(values=tuple(values), threshold=kmeans_threshold(values))
+
+    verdict = match(read, WIDE)
+    circle = near_misses(read, WIDE)
+    payloads = [item.payload for item in circle]
+
+    assert verdict is not None and not verdict.trustworthy, "назвать по-прежнему нельзя"
+    assert verdict.mismatched > 2, "общих помех больше двух — старый отбор давал пустоту"
+    assert circle, "круг не пустой"
+    assert WIDE_TRUTH in payloads[:2], "настоящий владелец среди первых"
+    assert all(item.mismatched_key <= circle[0].mismatched_key + 1 for item in circle)
+
+
+def test_krug_s_imenami_ne_lomaet_razmetku() -> None:
+    """Имена в круге — из Telegram, а ответ уходит с HTML-разметкой.
+
+    И круг обязан звучать как круг: «вот кто мог быть», а не «вот кто это».
+    """
+    from app.db import Student
+    from app.services.trace import _damaged_note
+
+    read = flipped(WIDE_TRUTH, key_bits()[3])
+    verdict = match(read, WIDE)
+    assert verdict is not None
+    circle = near_misses(read, WIDE)
+    student = Student(tg_user_id=1, uid=195, full_name="Рога & <b>Копыта</b>", username="rk")
+
+    note = _damaged_note(read, WIDE, verdict, circle, {195: student})
+
+    assert "0195" in note
+    assert "&amp;" in note and "<b>Копыта" not in note
+    assert "@rk" in note
+    assert "не доказательство" in note
+    assert "Назвать участника нельзя" in note
+
+
+def test_v_krug_ne_popadaet_vsya_tolpa() -> None:
+    """Круг — это несколько ближайших, а не полсотни «тоже похожих»."""
+    read = flipped(WIDE_TRUTH, *key_bits()[:3])
+
+    assert len(near_misses(read, WIDE)) <= 5
 
 
 def test_chistoe_chtenie_nazyvaet_cheloveka() -> None:

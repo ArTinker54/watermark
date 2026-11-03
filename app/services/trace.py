@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from html import escape
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -41,6 +42,7 @@ from app.watermark import (
     MIN_MARGIN,
     READABLE_SCALE,
     CoarseMatch,
+    NearMiss,
     Payload,
     SoftRead,
     Verdict,
@@ -151,18 +153,47 @@ class _Candidate:
     coarse: CoarseMatch
 
 
-def _damaged_note(read: SoftRead, issued: Sequence[str], verdict: Verdict) -> str:
+def _suspect_line(miss: NearMiss, students: Mapping[int, Student]) -> str | None:
+    parsed = Payload.parse(miss.payload)
+    if parsed is None:
+        return None
+    student = students.get(parsed.uid)
+    if student is None:
+        who = "в базе нет"
+    else:
+        # Имя приходит из Telegram и может содержать что угодно, а ответ бота
+        # уходит с разметкой: один «<» в имени — и Telegram отвергнет всё
+        # сообщение, автор не увидит даже причину отказа.
+        who = escape(student.full_name or "без имени")
+        if student.username:
+            who += f" @{escape(student.username)}"
+    return f"• {parsed.uid:04d} — {who} (опознающих бит мимо: {miss.mismatched_key})"
+
+
+def _damaged_note(
+    read: SoftRead,
+    issued: Sequence[str],
+    verdict: Verdict,
+    suspects: Sequence[NearMiss] = (),
+    students: Mapping[int, Student] | None = None,
+) -> str:
     """Объяснение, почему метка есть, а имени не будет.
 
     Кандидаты показываются намеренно: автору полезно знать круг, но между
     «вот эти шестеро» и «это он» — принципиальная разница, и стирать её нельзя.
+    Поэтому список подан как круг по убыванию вероятности, а не как ответ.
     """
-    uids = [
-        f"{parsed.uid:04d}"
-        for parsed in (Payload.parse(item) for item in near_misses(read, issued))
-        if parsed is not None
+    lines = [
+        line
+        for line in (_suspect_line(item, students or {}) for item in suspects)
+        if line is not None
     ]
-    who = ", ".join(uids) if uids else "сузить не удалось"
+    who = (
+        "\n\nКруг, по убыванию вероятности — это не доказательство, метка "
+        "повреждена:\n" + "\n".join(lines)
+        if lines
+        else " Кандидаты: сузить не удалось"
+    )
 
     if verdict.mismatched_key:
         # Разошлись именно опознающие биты — те, которыми копии и отличаются
@@ -193,7 +224,7 @@ def _damaged_note(read: SoftRead, issued: Sequence[str], verdict: Verdict) -> st
             f"так же похожа на прочитанное (отрыв {verdict.margin:.2f} при пороге "
             f"{MIN_MARGIN}) — одного сбитого бита хватило бы, чтобы поменять ответ"
         )
-    return f"{head}. Назвать участника нельзя. Кандидаты: {who}"
+    return f"{head}. Назвать участника нельзя.{who}"
 
 
 def _unknown_student(payload: Payload) -> str:
@@ -478,15 +509,30 @@ class TraceService:
             # нечестно. Пусть отказ объяснят по размеру и пережатию.
             return _Reading(raw=raw)
 
+        suspects = near_misses(read, issued)
+        students: dict[int, Student] = {}
+        async with self._session_factory() as session:
+            for item in suspects:
+                parsed = Payload.parse(item.payload)
+                if parsed is None:
+                    continue
+                student = await get_student_by_uid(session, parsed.uid)
+                if student is not None:
+                    students[parsed.uid] = student
+
         logger.info(
-            "метка урока %d прочиталась ненадёжно: расхождений %d, отрыв %.2f, "
-            "шаткий бит %.2f",
+            "метка урока %d прочиталась ненадёжно: расхождений %d (опознающих %d), "
+            "отрыв %.2f, шаткий бит %.2f, круг %s",
             lesson.id,
             verdict.mismatched,
+            verdict.mismatched_key,
             verdict.margin,
             verdict.weakest_bit,
+            [item.payload for item in suspects],
         )
-        return _Reading(raw=raw, damaged=_damaged_note(read, issued, verdict))
+        return _Reading(
+            raw=raw, damaged=_damaged_note(read, issued, verdict, suspects, students)
+        )
 
     async def _try_fragment(
         self, suspect: BgrImage, candidate: _Candidate, *, hint: CoarseMatch | None
