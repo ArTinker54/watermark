@@ -284,13 +284,17 @@ class NearMiss:
     """Насколько эта копия объясняет прочитанное хуже первой в круге.
 
     В тех же единицах, что и ``Verdict.margin``: доли уверенности одного бита.
-    Ниже ``MIN_MARGIN`` копия от первой не отличается — между ними выбирает
-    один едва прочитанный бит.
+    Только для порядка и журнала — неотличимость решает ``level``.
     """
 
-    @property
-    def level_with_first(self) -> bool:
-        return self.gap < MIN_MARGIN
+    level: bool
+    """По этой картинке от первой копии не отличается.
+
+    Так бывает, когда каждый бит, в котором две копии расходятся, прочитан
+    едва-едва — уверенностью ниже ``MIN_MARGIN``. Считать это по сумме
+    отставания нельзя: два едва прочитанных бита в сумме легко перевешивают
+    порог, и владелец, которого от первого не отличить, выглядел бы «хуже».
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,12 +302,16 @@ class Circle:
     """Круг копий, из которых могла получиться повреждённая метка."""
 
     members: tuple[NearMiss, ...]
-    level_total: int
-    """Сколько выданных копий вровень с первой, считая её саму.
+    level_payloads: tuple[str, ...] = ()
+    """Все выданные копии вровень с первой, считая её саму, по порядку.
 
-    Может быть больше, чем показано: круг ограничен, а молча обрезанный
-    список выглядит полным.
+    Их может быть больше, чем показано: круг ограничен, а молча обрезанный
+    список выглядит полным. Полный список нужен хотя бы в журнале.
     """
+
+    @property
+    def level_total(self) -> int:
+        return len(self.level_payloads)
 
 
 def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 5) -> Circle:
@@ -326,7 +334,8 @@ def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 5) -> Cir
     совпадение — нет. Поэтому решает оно.
     """
     centred = [value - read.threshold for value in read.values]
-    scored: list[tuple[float, str]] = []
+    weak = [abs(offset) / read.spread < MIN_MARGIN for offset in centred]
+    scored: list[tuple[float, str, tuple[bool, ...]]] = []
     for payload in dict.fromkeys(issued):
         bits = bits_of(payload)
         if len(bits) != len(centred):
@@ -334,16 +343,25 @@ def near_misses(read: SoftRead, issued: Iterable[str], *, limit: int = 5) -> Cir
         score = sum(
             offset if bit else -offset for bit, offset in zip(bits, centred, strict=True)
         )
-        scored.append((score, payload))
+        scored.append((score, payload, bits))
     if not scored:
-        return Circle(members=(), level_total=0)
+        return Circle(members=())
 
     scored.sort(key=lambda item: (-item[0], item[1]))
-    best = scored[0][0]
+    best, _, first = scored[0]
     unit = 2 * read.spread
-    gaps = [((best - score) / unit, payload) for score, payload in scored]
+
+    def level(bits: tuple[bool, ...]) -> bool:
+        return all(
+            weak[index] for index, (a, b) in enumerate(zip(bits, first, strict=True)) if a != b
+        )
+
+    ranked = [
+        NearMiss(payload=payload, gap=(best - score) / unit, level=level(bits))
+        for score, payload, bits in scored
+    ]
     return Circle(
-        members=tuple(NearMiss(payload=payload, gap=gap) for gap, payload in gaps[:limit]),
-        level_total=sum(1 for gap, _ in gaps if gap < MIN_MARGIN),
+        members=tuple(ranked[:limit]),
+        level_payloads=tuple(item.payload for item in ranked if item.level),
     )
 

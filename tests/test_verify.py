@@ -256,14 +256,16 @@ def test_krug_ne_pustoy_pri_pomehah_v_obschih_bitah() -> None:
     assert WIDE_TRUTH in payloads[:2], "настоящий владелец среди первых"
 
 
-def noisy(payload: str, *, weak: list[int]) -> SoftRead:
-    """Как в бою: шесть уверенных помех в общих битах и слабо сбитые ``weak``."""
+def noisy(
+    payload: str, *, weak: list[int], offset: float = 0.03, noise: int = 6
+) -> SoftRead:
+    """Как в бою: уверенные помехи в общих битах и слабо сбитые ``weak``."""
     bits = list(bits_of(payload))
-    for index in [index for index in range(95) if index not in key_bits()][:6]:
+    for index in [index for index in range(95) if index not in key_bits()][:noise]:
         bits[index] = not bits[index]
     values = [0.5 + (0.4 if bit else -0.4) for bit in bits]
     for index in weak:
-        values[index] = 0.5 + (-0.03 if bits[index] else 0.03)
+        values[index] = 0.5 + (-offset if bits[index] else offset)
     return SoftRead(values=tuple(values), threshold=kmeans_threshold(values))
 
 
@@ -274,12 +276,17 @@ def lands_on_issued(*flips: int) -> bool:
     return tuple(bits) in {bits_of(item) for item in WIDE}
 
 
-def test_vladelec_ne_vypadaet_kogda_dva_sboya_dayut_chuzhuyu_kopiyu() -> None:
+@pytest.mark.parametrize("offset", [0.03, 0.035, 0.05])
+def test_vladelec_ne_vypadaet_kogda_dva_sboya_dayut_chuzhuyu_kopiyu(offset: float) -> None:
     """Найдено проверкой: два слабых сбоя превратили метку в чужую выданную.
 
     У владельца тогда два «мимо», и отбор окном по числу бит его выбрасывал,
     подставляя людей со сбоем уверенно прочитанного бита. По совпадению же
     он второй, почти вровень с победителем.
+
+    Вторая проверка нашла и следующий слой: «вровень» считалось по сумме
+    отставания, и уже при 0.035 два едва прочитанных бита в сумме перевешивали
+    порог — владелец оставался без пометки прямо под чужой копией.
     """
     pair = next(
         (a, b)
@@ -287,13 +294,14 @@ def test_vladelec_ne_vypadaet_kogda_dva_sboya_dayut_chuzhuyu_kopiyu() -> None:
         for b in key_bits()[position + 1 :]
         if lands_on_issued(a, b)
     )
-    read = noisy(WIDE_TRUTH, weak=list(pair))
+    read = noisy(WIDE_TRUTH, weak=list(pair), offset=offset)
 
     circle = near_misses(read, WIDE)
     owner = next(item for item in circle.members if item.payload == WIDE_TRUTH)
 
     assert circle.members[0].payload != WIDE_TRUTH, "первым встала чужая копия"
-    assert owner.level_with_first, "и владелец помечен как неотличимый от неё"
+    assert owner.level, "и владелец помечен как неотличимый от неё"
+    assert circle.members[0].level, "пометка симметрична — у первого тоже"
 
 
 def test_pervyy_v_kruge_ne_vyglyadit_opoznannym() -> None:
@@ -314,25 +322,67 @@ def test_pervyy_v_kruge_ne_vyglyadit_opoznannym() -> None:
     owner = Student(tg_user_id=1, uid=195, full_name="Владелец")
 
     note = _damaged_note(read, WIDE, verdict, circle, {195: owner})
+    first = circle.members[0].payload.split("|")[1]
 
     assert "мимо: 0" not in note
+    assert "опознающие биты сошлись" not in note, "заголовок не намекает на первого"
     assert "первый в списке не обязательно источник" in note
-    assert "0195 — Владелец — вровень с первым" in note
+    assert "0195 — Владелец — вровень" in note
+    assert f"• {first} — в базе нет — вровень" in note, "первый помечен так же"
+
+
+@pytest.mark.parametrize("noise", [2, 6])
+def test_prichina_otkaza_nazvana_verno(noise: int) -> None:
+    """Отказ из-за соседа вровень не выдаётся за «слишком шумное чтение».
+
+    При двух помехах чтение вполне годное — помешал сосед, и говорить про шум
+    было бы неправдой. При шести мешают оба, и честнее назвать соседа: его
+    видно по пометкам в круге.
+    """
+    from app.services.trace import _damaged_note
+
+    shaky = next(index for index in key_bits() if lands_on_issued(index))
+    read = noisy(WIDE_TRUTH, weak=[shaky], noise=noise)
+    verdict = match(read, WIDE)
+    assert verdict is not None and verdict.mismatched_key == 0
+    assert verdict.margin < MIN_MARGIN
+
+    note = _damaged_note(read, WIDE, verdict, near_misses(read, WIDE), {})
+
+    assert "другая почти так же близка" in note
+    assert "шумное" not in note
+
+
+def test_odna_kopiya_bez_abzaca_pro_poryadok() -> None:
+    """Выдана одна копия — круг из одной строки без рассуждений про «первого»."""
+    from app.services.trace import _damaged_note
+
+    only = [WIDE_TRUTH]
+    read = noisy(WIDE_TRUTH, weak=[])
+    verdict = match(read, only)
+    assert verdict is not None and not verdict.trustworthy
+
+    note = _damaged_note(read, only, verdict, near_misses(read, only), {})
+
+    assert "Ближе всего прочитанное к копии" in note
+    assert "первый в списке" not in note
 
 
 def test_skrytye_vrovne_ne_teryayutsya_molcha() -> None:
-    """Если вровень с первым больше, чем влезло в круг, — так и сказано."""
+    """Если вровень больше, чем влезло в круг, — так и сказано."""
     from app.services.trace import _damaged_note
 
     read = noisy(WIDE_TRUTH, weak=list(key_bits()[:4]))
     verdict = match(read, WIDE)
     assert verdict is not None
     circle = near_misses(read, WIDE, limit=2)
-    assert circle.level_total > 2, "опыт поставлен на широкий круг"
+    shown = sum(1 for item in circle.members if item.level)
+    assert circle.level_total > shown, "опыт поставлен на широкий круг"
+    assert WIDE_TRUTH in circle.level_payloads, "в полном списке владелец есть"
 
     note = _damaged_note(read, WIDE, verdict, circle, {})
 
-    assert f"ещё {circle.level_total - 2} вровень с первым" in note
+    assert f"ещё вровень с ними: {circle.level_total - shown}" in note
 
 
 def test_krug_s_imenami_ne_lomaet_razmetku() -> None:
