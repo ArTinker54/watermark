@@ -7,7 +7,7 @@ Telegram здесь подменён заглушкой, которая пере
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -57,6 +57,7 @@ from app.services import (
     TraceService,
 )
 from app.services.lessons import save_lesson
+from app.services.trace import _Attempt
 from app.watermark import READABLE_SCALE, Payload, WatermarkEngine, embed_async
 from app.watermark.text import extract as extract_text
 from app.watermark.text import strip_marks
@@ -1649,6 +1650,35 @@ async def test_partial_extraction_is_rejected(
 
     assert isinstance(result, TraceMiss)
     assert "не читается" in result.reason
+
+
+def test_tiny_false_match_does_not_explain_the_refusal() -> None:
+    """Отказ объясняют крупным настоящим совпадением, а не мелким ложным.
+
+    Случай с тома: скриншот урока #320 во весь кадр (121%, похожесть 0.92),
+    а чуть более похожим «нашёлся» урок #6 пятнышком 145×73 в 18%. Бот ответил
+    «слишком мелко, урок #6», хотя метку просто не смогли прочитать.
+    """
+    tracer = TraceService(engine=Mock(), session_factory=Mock(), min_confidence=0.5)
+    tiny = _Attempt(
+        hit=None, confidence=0.94, found_size=(145, 73), original_size=(800, 405), lesson_id=6
+    )
+    real = _Attempt(
+        hit=None, confidence=0.9197, found_size=(970, 671), original_size=(800, 553), lesson_id=320
+    )
+
+    for attempts in ([tiny, real], [real, tiny]):
+        result = tracer._miss(attempts, checked=2)
+        assert result.best_lesson_id == 320
+        assert result.found_size == (970, 671)
+        assert "не читается" in result.reason
+        assert "занимает" not in result.reason
+
+    # А настоящее превью далёкое крупное ложное совпадение не перебивает.
+    stranger = replace(real, confidence=0.6)
+    result = tracer._miss([tiny, stranger], checked=2)
+    assert result.best_lesson_id == 6
+    assert "занимает" in result.reason
 
 
 class _BrokenCourseBot(FakeBot):
